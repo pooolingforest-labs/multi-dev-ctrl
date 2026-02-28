@@ -6,7 +6,7 @@ struct AppConfig: Decodable {
     let projects: [ProjectConfig]
 }
 
-struct ProjectConfig: Decodable, Identifiable {
+struct ProjectConfig: Decodable, Identifiable, Equatable {
     let name: String
     let path: String
     let actions: [ProjectAction]
@@ -18,7 +18,7 @@ struct ProjectConfig: Decodable, Identifiable {
     }
 }
 
-struct ProjectAction: Decodable {
+struct ProjectAction: Decodable, Equatable {
     let type: ActionType
     let command: String?
     let commands: [String]?
@@ -30,6 +30,29 @@ enum ActionType: String, Decodable {
     case openIterm
     case openItermSplit
     case openApp
+}
+
+enum GitCommitState {
+    case latest
+    case needsCommit
+
+    var marker: String {
+        switch self {
+        case .latest:
+            return "🟢"
+        case .needsCommit:
+            return "🟠"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .latest:
+            return "Latest commit state"
+        case .needsCommit:
+            return "Uncommitted changes or not on latest commit"
+        }
+    }
 }
 
 @MainActor
@@ -87,6 +110,79 @@ final class ConfigStore: ObservableObject {
     }
 }
 
+final class GitStatusStore: ObservableObject {
+    @Published private(set) var states: [String: GitCommitState] = [:]
+
+    func refresh(projects: [ProjectConfig]) {
+        let snapshot = projects.map { (name: $0.name, path: $0.expandedPath) }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var nextStates: [String: GitCommitState] = [:]
+
+            for project in snapshot {
+                nextStates[project.name] = Self.resolveCommitState(path: project.path)
+            }
+
+            DispatchQueue.main.async {
+                self?.states = nextStates
+            }
+        }
+    }
+
+    func state(for project: ProjectConfig) -> GitCommitState {
+        states[project.name] ?? .needsCommit
+    }
+
+    private static func resolveCommitState(path: String) -> GitCommitState {
+        let inWorkTree = runGitCommand(["-C", path, "rev-parse", "--is-inside-work-tree"]) == "true"
+        guard inWorkTree else {
+            return .needsCommit
+        }
+
+        let dirtyState = runGitCommand(["-C", path, "status", "--porcelain"]) ?? ""
+        if !dirtyState.isEmpty {
+            return .needsCommit
+        }
+
+        let head = runGitCommand(["-C", path, "rev-parse", "HEAD"]) ?? ""
+        guard !head.isEmpty else {
+            return .needsCommit
+        }
+
+        let upstream = runGitCommand(["-C", path, "rev-parse", "--verify", "--quiet", "@{u}"])
+        guard let upstream, !upstream.isEmpty else {
+            return .latest
+        }
+
+        return head == upstream ? .latest : .needsCommit
+    }
+
+    private static func runGitCommand(_ args: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = args
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 private struct ManagedProcess {
     let id: UUID
     let process: Process
@@ -100,6 +196,7 @@ final class ProjectRunner: ObservableObject {
 
     private let fileManager = FileManager.default
     private var processesByProject: [String: [ManagedProcess]] = [:]
+    private var terminalWindowIDsByProject: [String: Int] = [:]
 
     private var logsDirectory: URL {
         fileManager.homeDirectoryForCurrentUser
@@ -108,9 +205,23 @@ final class ProjectRunner: ObservableObject {
     }
 
     func run(_ project: ProjectConfig) {
-        stop(projectName: project.name, silent: true)
+        let hasRunningProcess = hasRunningProcesses(projectName: project.name)
+
+        if hasRunningProcess || hasTerminalAction(project: project) {
+            if focusExistingWindow(for: project) {
+                statusMessage = "\(project.name): already running, focused window"
+                return
+            }
+
+            if hasRunningProcess {
+                statusMessage = "\(project.name): already running"
+                return
+            }
+        }
 
         var startedBackgroundProcess = false
+        let projectMarker = markerForProject(project.name)
+        let projectTitle = project.name
 
         for action in project.actions {
             switch action.type {
@@ -129,7 +240,10 @@ final class ProjectRunner: ObservableObject {
 
             case .openIterm:
                 let command = action.command
-                if openInIterm(path: project.expandedPath, command: command) {
+                if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle) {
+                    if windowID > 0 {
+                        terminalWindowIDsByProject[project.name] = windowID
+                    }
                     statusMessage = "\(project.name): opened iTerm"
                 } else {
                     statusMessage = "\(project.name): failed to open iTerm"
@@ -142,7 +256,10 @@ final class ProjectRunner: ObservableObject {
                     continue
                 }
 
-                if openInItermSplit(path: project.expandedPath, commands: commands) {
+                if let windowID = openInItermSplit(path: project.expandedPath, commands: commands, marker: projectMarker, title: projectTitle) {
+                    if windowID > 0 {
+                        terminalWindowIDsByProject[project.name] = windowID
+                    }
                     statusMessage = "\(project.name): opened iTerm split"
                 } else {
                     statusMessage = "\(project.name): failed to open iTerm split"
@@ -166,6 +283,40 @@ final class ProjectRunner: ObservableObject {
             runningProjects.insert(project.name)
             statusMessage = "\(project.name): setup launched"
         }
+    }
+
+    private func hasRunningProcesses(projectName: String) -> Bool {
+        guard let managedProcesses = processesByProject[projectName] else {
+            return false
+        }
+
+        return managedProcesses.contains(where: { $0.process.isRunning })
+    }
+
+    private func hasTerminalAction(project: ProjectConfig) -> Bool {
+        project.actions.contains(where: { $0.type == .openIterm || $0.type == .openItermSplit })
+    }
+
+    private func markerForProject(_ projectName: String) -> String {
+        projectName
+    }
+
+    private func focusExistingWindow(for project: ProjectConfig) -> Bool {
+        if hasTerminalAction(project: project) {
+            if let windowID = terminalWindowIDsByProject[project.name], focusItermWindow(windowID: windowID) {
+                return true
+            }
+
+            if focusItermSession(marker: markerForProject(project.name)) {
+                return true
+            }
+        }
+
+        if let appName = project.actions.first(where: { $0.type == .openApp })?.appName, !appName.isEmpty {
+            return openApplication(named: appName)
+        }
+
+        return false
     }
 
     func stop(projectName: String, silent: Bool = false) {
@@ -253,64 +404,25 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    private func openInIterm(path: String, command: String?) -> Bool {
-        guard let command, !command.isEmpty else {
-            if openApplicationWithPath(appName: "iTerm", path: path) {
-                return true
-            }
-
-            return openApplicationWithPath(appName: "Terminal", path: path)
-        }
-
-        let joinedCommand = "cd \(shellEscape(path)); \(command)"
-        let appleScriptCommand = escapeForAppleScript(joinedCommand)
-
+    private func focusItermSession(marker: String) -> Bool {
+        let escapedMarker = escapeForAppleScript(marker)
         let script = """
         tell application "iTerm"
             activate
-            if (count of windows) = 0 then
-                create window with default profile
-            end if
-            tell current window
-                create tab with default profile
-                tell current session
-                    write text "\(appleScriptCommand)"
-                end tell
-            end tell
-        end tell
-        """
-
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
-            if error == nil {
-                return true
-            }
-        }
-
-        return runTerminalFallback(path: path, command: command)
-    }
-
-    private func openInItermSplit(path: String, commands: [String]) -> Bool {
-        let commandA = escapeForAppleScript("cd \(shellEscape(path)); \(commands[0])")
-        let commandB = escapeForAppleScript("cd \(shellEscape(path)); \(commands[1])")
-
-        let script = """
-        tell application "iTerm"
-            activate
-            if (count of windows) = 0 then
-                create window with default profile
-            end if
-            tell current window
-                create tab with default profile
-                tell current session of current tab
-                    write text "\(commandA)"
-                    set splitSession to (split vertically with default profile)
-                end tell
-                tell splitSession
-                    write text "\(commandB)"
-                end tell
-            end tell
+            repeat with w in windows
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        if (name of s as text) is "\(escapedMarker)" then
+                            tell w
+                                set current tab to t
+                            end tell
+                            set current window to w
+                            return true
+                        end if
+                    end repeat
+                end repeat
+            end repeat
+            return false
         end tell
         """
 
@@ -319,8 +431,149 @@ final class ProjectRunner: ObservableObject {
         }
 
         var error: NSDictionary?
-        appleScript.executeAndReturnError(&error)
-        return error == nil
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return false
+        }
+
+        if let stringValue = result.stringValue {
+            return stringValue.lowercased() == "true"
+        }
+
+        return result.booleanValue
+    }
+
+    private func focusItermWindow(windowID: Int) -> Bool {
+        let script = """
+        tell application "iTerm"
+            activate
+            try
+                set targetWindow to (first window whose id is \(windowID))
+                set current window to targetWindow
+                return true
+            on error
+                return false
+            end try
+        end tell
+        """
+
+        guard let appleScript = NSAppleScript(source: script) else {
+            return false
+        }
+
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return false
+        }
+
+        if let stringValue = result.stringValue {
+            return stringValue.lowercased() == "true"
+        }
+
+        return result.booleanValue
+    }
+
+    private func openInIterm(path: String, command: String?, marker: String, title: String) -> Int? {
+        let joinedCommand = buildItermCommand(path: path, command: command, title: title)
+
+        let appleScriptCommand = escapeForAppleScript(joinedCommand)
+        let escapedMarker = escapeForAppleScript(marker)
+
+        let script = """
+        tell application "iTerm"
+            activate
+            set newWindow to (create window with default profile)
+            tell current session of newWindow
+                set name to "\(escapedMarker)"
+                write text "\(appleScriptCommand)"
+            end tell
+            return id of newWindow
+        end tell
+        """
+
+        if let appleScript = NSAppleScript(source: script) {
+            var error: NSDictionary?
+            let result = appleScript.executeAndReturnError(&error)
+            if error == nil {
+                if let parsed = parseIntValue(result) {
+                    return parsed
+                }
+            }
+        }
+
+        guard let command, !command.isEmpty else {
+            if openApplicationWithPath(appName: "Terminal", path: path) {
+                return -1
+            }
+            return nil
+        }
+
+        if runTerminalFallback(path: path, command: command) {
+            return -1
+        }
+        return nil
+    }
+
+    private func openInItermSplit(path: String, commands: [String], marker: String, title: String) -> Int? {
+        let commandA = escapeForAppleScript(buildItermCommand(path: path, command: commands[0], title: title))
+        let commandB = escapeForAppleScript(buildItermCommand(path: path, command: commands[1], title: title))
+        let escapedMarker = escapeForAppleScript(marker)
+
+        let script = """
+        tell application "iTerm"
+            activate
+            set newWindow to (create window with default profile)
+            tell current session of newWindow
+                set name to "\(escapedMarker)"
+                write text "\(commandA)"
+                set splitSession to (split vertically with default profile)
+                tell splitSession
+                    set name to "\(escapedMarker)"
+                    write text "\(commandB)"
+                end tell
+            end tell
+            return id of newWindow
+        end tell
+        """
+
+        guard let appleScript = NSAppleScript(source: script) else {
+            return nil
+        }
+
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return nil
+        }
+
+        return parseIntValue(result)
+    }
+
+    private func buildItermCommand(path: String, command: String?, title: String) -> String {
+        let titleCommand = "printf '\\033]1;%s\\007\\033]2;%s\\007' \(shellEscape(title)) \(shellEscape(title))"
+        var parts: [String] = [
+            "cd \(shellEscape(path))",
+            "export DISABLE_AUTO_TITLE=true",
+            titleCommand
+        ]
+
+        if let command, !command.isEmpty {
+            parts.append("(while true; do \(titleCommand); sleep 1; done) & _mdc_title_pid=$!")
+            parts.append("trap 'kill $_mdc_title_pid 2>/dev/null' EXIT INT TERM")
+            parts.append(command)
+        }
+
+        return parts.joined(separator: "; ")
+    }
+
+    private func parseIntValue(_ descriptor: NSAppleEventDescriptor) -> Int? {
+        if let stringValue = descriptor.stringValue, let parsed = Int(stringValue) {
+            return parsed
+        }
+
+        let parsed = Int(descriptor.int32Value)
+        return parsed == 0 ? nil : parsed
     }
 
     private func openApplicationWithPath(appName: String, path: String) -> Bool {
@@ -383,6 +636,7 @@ final class ProjectRunner: ObservableObject {
 struct MenuContentView: View {
     @ObservedObject var configStore: ConfigStore
     @ObservedObject var runner: ProjectRunner
+    @ObservedObject var gitStore: GitStatusStore
 
     var body: some View {
         if configStore.projects.isEmpty {
@@ -392,12 +646,10 @@ struct MenuContentView: View {
                 Button {
                     runner.run(project)
                 } label: {
-                    if runner.runningProjects.contains(project.name) {
-                        Label(project.name, systemImage: "bolt.fill")
-                    } else {
-                        Label(project.name, systemImage: "play")
-                    }
+                    let state = gitStore.state(for: project)
+                    Label("\(project.name) \(state.marker)", systemImage: runner.runningProjects.contains(project.name) ? "bolt.fill" : "play")
                 }
+                .help(gitStore.state(for: project).description)
 
                 if runner.runningProjects.contains(project.name) {
                     Button("Stop \(project.name)") {
@@ -411,6 +663,7 @@ struct MenuContentView: View {
 
         Button("Reload Config") {
             configStore.reload()
+            gitStore.refresh(projects: configStore.projects)
         }
 
         Button("Open Config Folder") {
@@ -434,12 +687,17 @@ struct MenuContentView: View {
 struct MultiDevCtrlApp: App {
     @StateObject private var configStore = ConfigStore()
     @StateObject private var runner = ProjectRunner()
+    @StateObject private var gitStore = GitStatusStore()
 
     var body: some Scene {
         MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
-            MenuContentView(configStore: configStore, runner: runner)
+            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore)
                 .onAppear {
                     configStore.reload()
+                    gitStore.refresh(projects: configStore.projects)
+                }
+                .onChange(of: configStore.projects) { projects in
+                    gitStore.refresh(projects: projects)
                 }
         }
         .menuBarExtraStyle(.menu)
