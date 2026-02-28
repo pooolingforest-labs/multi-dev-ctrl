@@ -1,0 +1,17 @@
+{
+  "projects": [
+    {
+      "name": "sample-web",
+      "path": "/Users/you/Documents/sample-web",
+      "actions": [
+        {
+          "type": "openItermSplit",
+          "commands": [
+            "npm run dev",
+            "npm run electron:dev"
+          ]
+        }
+      ]
+    }
+  ]
+}
