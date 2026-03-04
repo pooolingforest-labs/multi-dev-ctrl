@@ -2,30 +2,71 @@ import AppKit
 import Foundation
 import SwiftUI
 
-struct AppConfig: Decodable {
-    let projects: [ProjectConfig]
+enum ItermMode: String, Codable {
+    case window
+    case tab
 }
 
-struct ProjectConfig: Decodable, Identifiable, Equatable {
+enum EditorType: String, Codable, CaseIterable {
+    case vscode = "vscode"
+    case cursor = "cursor"
+    case antigravity = "antigravity"
+
+    var appName: String {
+        switch self {
+        case .vscode: return "Visual Studio Code"
+        case .cursor: return "Cursor"
+        case .antigravity: return "Antigravity"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .vscode: return "VS Code"
+        case .cursor: return "Cursor"
+        case .antigravity: return "Antigravity"
+        }
+    }
+}
+
+struct AppConfig: Codable {
+    let projects: [ProjectConfig]
+    var itermMode: ItermMode?
+    var editor: EditorType?
+}
+
+struct ProjectConfig: Codable, Identifiable, Equatable {
     let name: String
     let path: String
     let actions: [ProjectAction]
-
+    let group: String?
     var id: String { name }
 
     var expandedPath: String {
         (path as NSString).expandingTildeInPath
     }
+
+    enum CodingKeys: String, CodingKey {
+        case name, path, actions, group
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        path = try container.decode(String.self, forKey: .path)
+        actions = try container.decode([ProjectAction].self, forKey: .actions)
+        group = try container.decodeIfPresent(String.self, forKey: .group)
+    }
 }
 
-struct ProjectAction: Decodable, Equatable {
+struct ProjectAction: Codable, Equatable {
     let type: ActionType
     let command: String?
     let commands: [String]?
     let appName: String?
 }
 
-enum ActionType: String, Decodable {
+enum ActionType: String, Codable {
     case runCommand
     case openIterm
     case openItermSplit
@@ -39,9 +80,9 @@ enum GitCommitState {
     var marker: String {
         switch self {
         case .latest:
-            return "🟢"
+            return "✓"
         case .needsCommit:
-            return "🟠"
+            return "✗"
         }
     }
 
@@ -59,8 +100,11 @@ enum GitCommitState {
 final class ConfigStore: ObservableObject {
     @Published private(set) var projects: [ProjectConfig] = []
     @Published private(set) var statusMessage: String?
+    @Published var itermMode: ItermMode = .window
+    @Published var editor: EditorType = .cursor
 
     private let fileManager = FileManager.default
+    private var currentConfigURL: URL?
 
     var configPaths: [URL] {
         let home = fileManager.homeDirectoryForCurrentUser
@@ -73,13 +117,46 @@ final class ConfigStore: ObservableObject {
     func reload() {
         do {
             let configURL = try findConfigURL()
+            currentConfigURL = configURL
             let data = try Data(contentsOf: configURL)
             let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
             projects = decoded.projects
+            itermMode = decoded.itermMode ?? .window
+            editor = decoded.editor ?? .cursor
             statusMessage = "Loaded \(decoded.projects.count) projects from \(configURL.path)"
         } catch {
             projects = []
             statusMessage = "Config load failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setItermMode(_ mode: ItermMode) {
+        guard let configURL = currentConfigURL else { return }
+        do {
+            let data = try Data(contentsOf: configURL)
+            var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            json["itermMode"] = mode.rawValue
+            let output = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try output.write(to: configURL)
+            itermMode = mode
+            statusMessage = "iTerm 모드: \(mode == .tab ? "탭" : "윈도우")"
+        } catch {
+            statusMessage = "설정 저장 실패: \(error.localizedDescription)"
+        }
+    }
+
+    func setEditor(_ editor: EditorType) {
+        guard let configURL = currentConfigURL else { return }
+        do {
+            let data = try Data(contentsOf: configURL)
+            var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            json["editor"] = editor.rawValue
+            let output = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try output.write(to: configURL)
+            self.editor = editor
+            statusMessage = "에디터: \(editor.displayName)"
+        } catch {
+            statusMessage = "설정 저장 실패: \(error.localizedDescription)"
         }
     }
 
@@ -183,6 +260,77 @@ final class GitStatusStore: ObservableObject {
     }
 }
 
+@MainActor
+final class PortStatusStore: ObservableObject {
+    @Published private(set) var listeningPorts: Set<Int> = []
+    private var timer: Timer?
+
+    func startMonitoring() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        refresh()
+    }
+
+    func stopMonitoring() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func isPortListening(_ port: Int) -> Bool {
+        listeningPorts.contains(port)
+    }
+
+    func forceRefresh() {
+        refresh()
+    }
+
+    private func refresh() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let listening = Self.checkListeningPorts()
+            DispatchQueue.main.async {
+                self?.listeningPorts = listening
+            }
+        }
+    }
+
+    nonisolated private static func checkListeningPorts() -> Set<Int> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-iTCP", "-sTCP:LISTEN", "-nP", "-Fn"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return []
+        }
+
+        guard process.terminationStatus == 0 else { return [] }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return [] }
+
+        var ports = Set<Int>()
+        for line in output.split(separator: "\n") {
+            // lsof -Fn outputs lines like "n*:3000" or "n127.0.0.1:3000"
+            guard line.hasPrefix("n") else { continue }
+            if let colonIdx = line.lastIndex(of: ":") {
+                let portStr = line[line.index(after: colonIdx)...]
+                if let port = Int(portStr) {
+                    ports.insert(port)
+                }
+            }
+        }
+        return ports
+    }
+}
+
 private struct ManagedProcess {
     let id: UUID
     let process: Process
@@ -205,6 +353,14 @@ final class ProjectRunner: ObservableObject {
     private let fileManager = FileManager.default
     private var processesByProject: [String: [ManagedProcess]] = [:]
     private var terminalWindowIDsByProject: [String: Int] = [:]
+    private func portForProject(_ project: ProjectConfig, in projects: [ProjectConfig]) -> Int {
+        let index = projects.firstIndex(where: { $0.name == project.name }) ?? 0
+        return 3000 + index
+    }
+
+    func port(for project: ProjectConfig, in projects: [ProjectConfig]) -> Int {
+        portForProject(project, in: projects)
+    }
 
     private var logsDirectory: URL {
         fileManager.homeDirectoryForCurrentUser
@@ -212,7 +368,7 @@ final class ProjectRunner: ObservableObject {
             .appendingPathComponent("logs", isDirectory: true)
     }
 
-    func run(_ project: ProjectConfig) {
+    func run(_ project: ProjectConfig, allProjects: [ProjectConfig], itermMode: ItermMode = .window) {
         let hasRunningProcess = hasRunningProcesses(projectName: project.name)
 
         if hasRunningProcess || hasTerminalAction(project: project) {
@@ -230,14 +386,17 @@ final class ProjectRunner: ObservableObject {
         var startedBackgroundProcess = false
         let projectMarker = markerForProject(project.name)
         let projectTitle = project.name
+        let port = portForProject(project, in: allProjects)
+        let portStr = String(port)
 
         for action in project.actions {
             switch action.type {
             case .runCommand:
-                guard let command = action.command, !command.isEmpty else {
+                guard var command = action.command, !command.isEmpty else {
                     statusMessage = "\(project.name): runCommand requires a command"
                     continue
                 }
+                command = command.replacingOccurrences(of: "$PORT", with: portStr)
 
                 do {
                     try launchBackgroundCommand(projectName: project.name, path: project.expandedPath, command: command)
@@ -247,8 +406,9 @@ final class ProjectRunner: ObservableObject {
                 }
 
             case .openIterm:
-                let command = action.command
-                if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle) {
+                var command = action.command
+                command = command?.replacingOccurrences(of: "$PORT", with: portStr)
+                if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle, mode: itermMode) {
                     if windowID > 0 {
                         terminalWindowIDsByProject[project.name] = windowID
                     }
@@ -258,7 +418,7 @@ final class ProjectRunner: ObservableObject {
                 }
 
             case .openItermSplit:
-                let commands = normalizedCommands(action.commands)
+                let commands = normalizedCommands(action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: portStr) })
                 guard commands.count >= 2 else {
                     statusMessage = "\(project.name): openItermSplit requires at least 2 commands"
                     continue
@@ -293,7 +453,7 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    func openInVSCode(project: ProjectConfig) {
+    func openInEditor(project: ProjectConfig, editor: EditorType) {
         let path = project.expandedPath
 
         guard fileManager.fileExists(atPath: path) else {
@@ -301,12 +461,10 @@ final class ProjectRunner: ObservableObject {
             return
         }
 
-        if openApplicationWithPath(appName: "Visual Studio Code", path: path) ||
-            openApplicationWithPath(appName: "Visual Studio Code - Insiders", path: path) ||
-            openWithCodeCLI(path: path) {
-            statusMessage = "\(project.name): opened in VS Code"
+        if openApplicationWithPath(appName: editor.appName, path: path) {
+            statusMessage = "\(project.name): opened in \(editor.displayName)"
         } else {
-            statusMessage = "\(project.name): failed to open VS Code"
+            statusMessage = "\(project.name): \(editor.displayName) 실행 실패"
         }
     }
 
@@ -607,6 +765,48 @@ final class ProjectRunner: ObservableObject {
         return false
     }
 
+    func killPort(_ port: Int, projectPath: String? = nil, completion: (() -> Void)? = nil) {
+        DispatchQueue.global(qos: .utility).async {
+            // lsof로 PID 찾아서 kill
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-c", "lsof -t -i :\(port) | xargs kill -9 2>/dev/null; exit 0"]
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {}
+
+            if let path = projectPath {
+                let lockPath = URL(fileURLWithPath: path)
+                    .appendingPathComponent(".next/dev/lock").path
+                try? FileManager.default.removeItem(atPath: lockPath)
+            }
+
+            Thread.sleep(forTimeInterval: 0.5)
+            DispatchQueue.main.async { completion?() }
+        }
+    }
+
+    func killListeningPorts(projects: [ProjectConfig], completion: (() -> Void)? = nil) {
+        let group = DispatchGroup()
+        for project in projects {
+            let port = portForProject(project, in: projects)
+            group.enter()
+            killPort(port, projectPath: project.expandedPath) {
+                group.leave()
+            }
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            group.wait()
+            DispatchQueue.main.async {
+                self?.statusMessage = "전체 중지 완료"
+                completion?()
+            }
+        }
+    }
+
     func stop(projectName: String, silent: Bool = false) {
         guard let managedProcesses = processesByProject.removeValue(forKey: projectName) else {
             return
@@ -762,23 +962,49 @@ final class ProjectRunner: ObservableObject {
         return result.booleanValue
     }
 
-    private func openInIterm(path: String, command: String?, marker: String, title: String) -> Int? {
+    private func openInIterm(path: String, command: String?, marker: String, title: String, mode: ItermMode = .window) -> Int? {
         let joinedCommand = buildItermCommand(path: path, command: command, title: title)
 
         let appleScriptCommand = escapeForAppleScript(joinedCommand)
         let escapedMarker = escapeForAppleScript(marker)
 
-        let script = """
-        tell application "iTerm"
-            activate
-            set newWindow to (create window with default profile)
-            tell current session of newWindow
-                set name to "\(escapedMarker)"
-                write text "\(appleScriptCommand)"
+        let script: String
+        if mode == .tab {
+            script = """
+            tell application "iTerm"
+                activate
+                if (count of windows) = 0 then
+                    set newWindow to (create window with default profile)
+                    tell current session of newWindow
+                        set name to "\(escapedMarker)"
+                        write text "\(appleScriptCommand)"
+                    end tell
+                    return id of newWindow
+                else
+                    tell current window
+                        set newTab to (create tab with default profile)
+                        tell current session of newTab
+                            set name to "\(escapedMarker)"
+                            write text "\(appleScriptCommand)"
+                        end tell
+                        return id
+                    end tell
+                end if
             end tell
-            return id of newWindow
-        end tell
-        """
+            """
+        } else {
+            script = """
+            tell application "iTerm"
+                activate
+                set newWindow to (create window with default profile)
+                tell current session of newWindow
+                    set name to "\(escapedMarker)"
+                    write text "\(appleScriptCommand)"
+                end tell
+                return id of newWindow
+            end tell
+            """
+        }
 
         if let appleScript = NSAppleScript(source: script) {
             var error: NSDictionary?
@@ -939,55 +1165,96 @@ struct MenuContentView: View {
     @ObservedObject var configStore: ConfigStore
     @ObservedObject var runner: ProjectRunner
     @ObservedObject var gitStore: GitStatusStore
+    @ObservedObject var portStore: PortStatusStore
+
+    private var groupedProjects: [(group: String, projects: [ProjectConfig])] {
+        let projects = configStore.projects
+        var groupOrder: [String] = []
+        var groupMap: [String: [ProjectConfig]] = [:]
+
+        for project in projects {
+            let group = project.group ?? "기타"
+            if groupMap[group] == nil {
+                groupOrder.append(group)
+            }
+            groupMap[group, default: []].append(project)
+        }
+
+        return groupOrder.map { (group: $0, projects: groupMap[$0]!) }
+    }
 
     var body: some View {
         if configStore.projects.isEmpty {
-            Text("No projects")
+            Text("프로젝트 없음")
         } else {
-            ForEach(configStore.projects) { project in
-                HStack(spacing: 10) {
-                    Button {
-                        runner.run(project)
-                    } label: {
-                        let state = gitStore.state(for: project)
-                        Label("\(project.name) \(state.marker)", systemImage: runner.runningProjects.contains(project.name) ? "bolt.fill" : "play")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .buttonStyle(.plain)
-                    .help(gitStore.state(for: project).description)
-
-                    Button("Code") {
-                        runner.openInVSCode(project: project)
-                    }
-
-                    Button(runner.commitPushProjectsLaunching.contains(project.name) ? "실행 중..." : "커밋&푸시") {
-                        runner.runProjectCommitAndPushWithClaude(project: project)
-                    }
-                    .disabled(runner.commitPushProjectsLaunching.contains(project.name))
+            ForEach(Array(groupedProjects.enumerated()), id: \.offset) { index, section in
+                if index > 0 {
+                    Divider()
                 }
+                Text(section.group)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
 
-                if runner.runningProjects.contains(project.name) {
-                    Button("Stop \(project.name)") {
-                        runner.stop(projectName: project.name)
-                    }
+                ForEach(section.projects) { project in
+                    projectRow(project)
                 }
             }
         }
 
         Divider()
 
-        Button("Reload Config") {
-            configStore.reload()
-            gitStore.refresh(projects: configStore.projects)
+        Button("▶  전체 실행") {
+            for project in configStore.projects {
+                let port = runner.port(for: project, in: configStore.projects)
+                let alreadyRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+                if !alreadyRunning {
+                    runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+                }
+            }
         }
+        .disabled(configStore.projects.isEmpty)
+
+        Button("■  전체 중지") {
+            for project in configStore.projects {
+                runner.stop(projectName: project.name, silent: true)
+            }
+            runner.killListeningPorts(projects: configStore.projects) {
+                portStore.forceRefresh()
+            }
+        }
+        .disabled(configStore.projects.isEmpty)
 
         Button(runner.isBulkCommitRunning ? "전체 커밋 및 푸시 실행 중..." : "전체 커밋 및 푸시") {
             runner.runBulkCommitAndPushWithClaude(projects: configStore.projects)
         }
         .disabled(configStore.projects.isEmpty || runner.isBulkCommitRunning)
 
-        Button("Open Config Folder") {
+        Divider()
+
+        Button("설정 새로고침") {
+            configStore.reload()
+            gitStore.refresh(projects: configStore.projects)
+        }
+
+        Button("설정 폴더 열기") {
             configStore.openConfigFolder()
+        }
+
+        Menu("에디터: \(configStore.editor.displayName)") {
+            ForEach(EditorType.allCases, id: \.self) { editor in
+                Button("\(configStore.editor == editor ? "✓ " : "   ")\(editor.displayName)") {
+                    configStore.setEditor(editor)
+                }
+            }
+        }
+
+        Menu("iTerm 모드: \(configStore.itermMode == .tab ? "탭" : "윈도우")") {
+            Button("\(configStore.itermMode == .tab ? "✓ " : "   ")탭 모드") {
+                configStore.setItermMode(.tab)
+            }
+            Button("\(configStore.itermMode == .window ? "✓ " : "   ")윈도우 모드") {
+                configStore.setItermMode(.window)
+            }
         }
 
         if let message = runner.statusMessage ?? configStore.statusMessage {
@@ -997,8 +1264,52 @@ struct MenuContentView: View {
 
         Divider()
 
-        Button("Quit") {
+        Button("종료") {
             NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private func projectLabel(_ project: ProjectConfig) -> String {
+        let port = runner.port(for: project, in: configStore.projects)
+        let isRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+        let state = gitStore.state(for: project)
+        let dirty = state == .needsCommit ? " ✗" : ""
+
+        if isRunning {
+            return "🟢 \(project.name) :\(String(port))\(dirty)"
+        } else {
+            return "○  \(project.name)\(dirty)"
+        }
+    }
+
+    @ViewBuilder
+    private func projectRow(_ project: ProjectConfig) -> some View {
+        let port = runner.port(for: project, in: configStore.projects)
+        let isRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+
+        Menu(projectLabel(project)) {
+            Button("▶  실행") {
+                runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+            }
+
+            Button("↗  코드 (\(configStore.editor.displayName))") {
+                runner.openInEditor(project: project, editor: configStore.editor)
+            }
+
+            Button(runner.commitPushProjectsLaunching.contains(project.name) ? "⏳ 실행 중..." : "⬆  커밋 & 푸시") {
+                runner.runProjectCommitAndPushWithClaude(project: project)
+            }
+            .disabled(runner.commitPushProjectsLaunching.contains(project.name))
+
+            if isRunning {
+                Divider()
+                Button("■  중지") {
+                    runner.stop(projectName: project.name)
+                    runner.killPort(port, projectPath: project.expandedPath) {
+                        portStore.forceRefresh()
+                    }
+                }
+            }
         }
     }
 }
@@ -1008,14 +1319,16 @@ struct MultiDevCtrlApp: App {
     @StateObject private var configStore = ConfigStore()
     @StateObject private var runner = ProjectRunner()
     @StateObject private var gitStore = GitStatusStore()
+    @StateObject private var portStore = PortStatusStore()
     @State private var isMenuBarInserted = true
 
     var body: some Scene {
         MenuBarExtra("Dev Ctrl", systemImage: "terminal", isInserted: $isMenuBarInserted) {
-            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore)
+            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore, portStore: portStore)
                 .onAppear {
                     configStore.reload()
                     gitStore.refresh(projects: configStore.projects)
+                    portStore.startMonitoring()
                 }
                 .onChange(of: configStore.projects) { projects in
                     gitStore.refresh(projects: projects)

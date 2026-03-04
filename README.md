@@ -139,6 +139,85 @@ Example:
 ## 로그
 - 백그라운드 명령 로그: `~/.multi-dev-ctrl/logs/<project>.log`
 
+## 앱 설치
+
+빌드 후 `/Applications`에 .app 번들로 설치합니다.
+
+```bash
+make install
+```
+
+설치 후 실행:
+```bash
+open /Applications/MultiDevCtrl.app
+```
+
+로그인 시 자동 실행: **시스템 설정 > 일반 > 로그인 항목**에서 MultiDevCtrl 추가
+
+삭제:
+```bash
+make uninstall
+```
+
+## 프로젝트 그룹핑
+
+`group` 필드로 프로젝트를 그룹별로 묶어서 메뉴에 표시할 수 있습니다. `group`이 없으면 "기타"로 분류됩니다.
+
+```json
+{
+  "projects": [
+    { "name": "my-web", "group": "dropstudio", "path": "...", "actions": [...] },
+    { "name": "my-admin", "group": "dropstudio", "path": "...", "actions": [...] },
+    { "name": "other-app", "path": "...", "actions": [...] }
+  ]
+}
+```
+
+## iTerm 모드 설정
+
+메뉴 하단의 **iTerm 모드** 서브메뉴에서 전환하거나, `projects.json`에서 직접 설정할 수 있습니다.
+
+| 모드 | 설명 |
+|------|------|
+| `window` | 프로젝트마다 새 iTerm 윈도우 (기본값) |
+| `tab` | 하나의 iTerm 윈도우에 탭으로 열기 |
+
+```json
+{
+  "itermMode": "tab",
+  "projects": [...]
+}
+```
+
+## 포트 자동 감지
+
+각 프로젝트에 `3000 + index` 순서로 포트가 할당됩니다. 외부에서 직접 실행한 프로세스도 해당 포트가 열려있으면 메뉴에서 실행 중(🟢)으로 표시됩니다.
+
+## 메뉴 구조
+
+```
+── 그룹명 ──
+🟢 project-name :3000 ✗  ▸  실행 / 코드 / 커밋&푸시 / 중지
+○  project-name            ▸  실행 / 코드 / 커밋&푸시
+──────────────
+▶  전체 실행
+■  전체 중지
+전체 커밋 및 푸시
+──────────────
+설정 새로고침
+설정 폴더 열기
+iTerm 모드: 탭/윈도우  ▸
+──────────────
+종료
+```
+
+| 아이콘 | 의미 |
+|--------|------|
+| 🟢 | 실행 중 (포트 리슨 감지) |
+| ○ | 미실행 |
+| ✗ | Git 변경사항 있음 |
+| (없음) | Git 최신 상태 |
+
 ## 참고
 - iTerm 제어는 macOS 자동화 권한 허용이 필요할 수 있습니다.
 - 설정 파일 탐색 순서:
