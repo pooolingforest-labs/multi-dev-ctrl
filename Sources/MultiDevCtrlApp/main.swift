@@ -1320,17 +1320,19 @@ struct MultiDevCtrlApp: App {
     @StateObject private var runner = ProjectRunner()
     @StateObject private var gitStore = GitStatusStore()
     @StateObject private var portStore = PortStatusStore()
-    @State private var isMenuBarInserted = true
+    @State private var didSetup = false
 
     var body: some Scene {
-        MenuBarExtra("Dev Ctrl", systemImage: "terminal", isInserted: $isMenuBarInserted) {
+        MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
             MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore, portStore: portStore)
                 .onAppear {
+                    guard !didSetup else { return }
+                    didSetup = true
                     configStore.reload()
                     gitStore.refresh(projects: configStore.projects)
                     portStore.startMonitoring()
                 }
-                .onChange(of: configStore.projects) { projects in
+                .onChange(of: configStore.projects) { _, projects in
                     gitStore.refresh(projects: projects)
                 }
         }

@@ -1,5 +1,5 @@
 APP_NAME = MultiDevCtrl
-BUNDLE_ID = com.woojin.multi-dev-ctrl
+BUNDLE_ID = com.woojin.dev-ctrl
 APP_DIR = /Applications/$(APP_NAME).app
 CONTENTS = $(APP_DIR)/Contents
 MACOS = $(CONTENTS)/MacOS

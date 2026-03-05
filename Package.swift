@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "multi-dev-ctrl",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(name: "multi-dev-ctrl", targets: ["MultiDevCtrlApp"])
