@@ -40,6 +40,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     let path: String
     let actions: [ProjectAction]
     let group: String?
+    let stopCommand: String?
     var id: String { name }
 
     var expandedPath: String {
@@ -47,7 +48,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, actions, group
+        case name, path, actions, group, stopCommand
     }
 
     init(from decoder: Decoder) throws {
@@ -56,6 +57,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
         path = try container.decode(String.self, forKey: .path)
         actions = try container.decode([ProjectAction].self, forKey: .actions)
         group = try container.decodeIfPresent(String.self, forKey: .group)
+        stopCommand = try container.decodeIfPresent(String.self, forKey: .stopCommand)
     }
 }
 
@@ -99,12 +101,12 @@ enum GitCommitState {
 @MainActor
 final class ConfigStore: ObservableObject {
     @Published private(set) var projects: [ProjectConfig] = []
-    @Published private(set) var statusMessage: String?
+    @Published var statusMessage: String?
     @Published var itermMode: ItermMode = .window
     @Published var editor: EditorType = .cursor
 
-    private let fileManager = FileManager.default
-    private var currentConfigURL: URL?
+    let fileManager = FileManager.default
+    var currentConfigURL: URL?
 
     var configPaths: [URL] {
         let home = fileManager.homeDirectoryForCurrentUser
@@ -343,6 +345,32 @@ private struct ClaudeTargetProject {
     let isNextJS: Bool
 }
 
+private enum StopCommandResult {
+    case notConfigured
+    case succeeded
+    case failed
+}
+
+private enum NodePackageManager {
+    case npm
+    case pnpm
+    case yarn
+    case bun
+
+    var installCommand: String {
+        switch self {
+        case .npm:
+            return "npm install"
+        case .pnpm:
+            return "pnpm install"
+        case .yarn:
+            return "yarn install"
+        case .bun:
+            return "bun install"
+        }
+    }
+}
+
 @MainActor
 final class ProjectRunner: ObservableObject {
     @Published private(set) var runningProjects: Set<String> = []
@@ -353,6 +381,7 @@ final class ProjectRunner: ObservableObject {
     private let fileManager = FileManager.default
     private var processesByProject: [String: [ManagedProcess]] = [:]
     private var terminalWindowIDsByProject: [String: Int] = [:]
+    private var dependencyInstallInProgressProjects: Set<String> = []
     private func portForProject(_ project: ProjectConfig, in projects: [ProjectConfig]) -> Int {
         let index = projects.firstIndex(where: { $0.name == project.name }) ?? 0
         return 3000 + index
@@ -383,6 +412,19 @@ final class ProjectRunner: ObservableObject {
             }
         }
 
+        if dependencyInstallInProgressProjects.contains(project.name) {
+            statusMessage = "\(project.name): 패키지 설치 진행 중입니다"
+            return
+        }
+
+        autoInstallDependenciesIfNeeded(project: project, allProjects: allProjects) { [weak self] installSuccess in
+            guard let self else { return }
+            guard installSuccess else { return }
+            self.executeProjectActions(project, allProjects: allProjects, itermMode: itermMode)
+        }
+    }
+
+    private func executeProjectActions(_ project: ProjectConfig, allProjects: [ProjectConfig], itermMode: ItermMode) {
         var startedBackgroundProcess = false
         let projectMarker = markerForProject(project.name)
         let projectTitle = project.name
@@ -450,6 +492,167 @@ final class ProjectRunner: ObservableObject {
         if startedBackgroundProcess {
             runningProjects.insert(project.name)
             statusMessage = "\(project.name): setup launched"
+        }
+    }
+
+    private func autoInstallDependenciesIfNeeded(
+        project: ProjectConfig,
+        allProjects: [ProjectConfig],
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let installCommand = installCommandIfNeeded(project: project, allProjects: allProjects) else {
+            completion(true)
+            return
+        }
+
+        let projectName = project.name
+        dependencyInstallInProgressProjects.insert(projectName)
+        statusMessage = "\(projectName): 의존성 설치 중..."
+
+        let projectPath = project.expandedPath
+        DispatchQueue.global(qos: .utility).async {
+            let success = Self.runShellCommand(path: projectPath, command: installCommand)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.dependencyInstallInProgressProjects.remove(projectName)
+
+                if success {
+                    self.statusMessage = "\(projectName): 의존성 설치 완료"
+                } else {
+                    self.statusMessage = "\(projectName): 의존성 설치 실패"
+                }
+
+                completion(success)
+            }
+        }
+    }
+
+    private func installCommandIfNeeded(project: ProjectConfig, allProjects: [ProjectConfig]) -> String? {
+        let projectRoot = URL(fileURLWithPath: project.expandedPath, isDirectory: true)
+        let packageJSONPath = projectRoot.appendingPathComponent("package.json").path
+        guard fileManager.fileExists(atPath: packageJSONPath) else {
+            return nil
+        }
+
+        let commands = commandsNeedingPreparation(project: project, allProjects: allProjects)
+        guard commands.contains(where: shouldAutoInstallDependencies) else {
+            return nil
+        }
+
+        return preferredNodePackageManager(for: commands, in: projectRoot).installCommand
+    }
+
+    private func commandsNeedingPreparation(project: ProjectConfig, allProjects: [ProjectConfig]) -> [String] {
+        let portStr = String(portForProject(project, in: allProjects))
+        var commands: [String] = []
+
+        for action in project.actions {
+            switch action.type {
+            case .runCommand:
+                if let command = action.command?
+                    .replacingOccurrences(of: "$PORT", with: portStr)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !command.isEmpty {
+                    commands.append(command)
+                }
+            case .openIterm:
+                if let command = action.command?
+                    .replacingOccurrences(of: "$PORT", with: portStr)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !command.isEmpty {
+                    commands.append(command)
+                }
+            case .openItermSplit:
+                let splitCommands = normalizedCommands(
+                    action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: portStr) }
+                )
+                commands.append(contentsOf: splitCommands)
+            case .openApp:
+                continue
+            }
+        }
+
+        return commands
+    }
+
+    private func shouldAutoInstallDependencies(command: String) -> Bool {
+        let lower = command.lowercased()
+
+        let installPatterns = [
+            "npm install",
+            "npm ci",
+            "pnpm install",
+            "pnpm i",
+            "yarn install",
+            "yarn --immutable",
+            "bun install"
+        ]
+        if installPatterns.contains(where: { lower.contains($0) }) {
+            return false
+        }
+
+        let runPatterns = [
+            "npm run",
+            "npm start",
+            "pnpm run",
+            "pnpm start",
+            "pnpm dev",
+            "yarn run",
+            "yarn start",
+            "yarn dev",
+            "bun run",
+            "bun dev"
+        ]
+        if runPatterns.contains(where: { lower.contains($0) }) {
+            return true
+        }
+
+        return lower.contains("npm ") || lower.contains("pnpm ") || lower.contains("yarn ") || lower.contains("bun ")
+    }
+
+    private func preferredNodePackageManager(for commands: [String], in projectRoot: URL) -> NodePackageManager {
+        let lowered = commands.map { $0.lowercased() }
+        if lowered.contains(where: { $0.contains("pnpm") }) {
+            return .pnpm
+        }
+        if lowered.contains(where: { $0.contains("yarn") }) {
+            return .yarn
+        }
+        if lowered.contains(where: { $0.contains("bun") }) {
+            return .bun
+        }
+        if lowered.contains(where: { $0.contains("npm") }) {
+            return .npm
+        }
+
+        if fileManager.fileExists(atPath: projectRoot.appendingPathComponent("pnpm-lock.yaml").path) {
+            return .pnpm
+        }
+        if fileManager.fileExists(atPath: projectRoot.appendingPathComponent("yarn.lock").path) {
+            return .yarn
+        }
+        if fileManager.fileExists(atPath: projectRoot.appendingPathComponent("bun.lock").path) ||
+            fileManager.fileExists(atPath: projectRoot.appendingPathComponent("bun.lockb").path) {
+            return .bun
+        }
+
+        return .npm
+    }
+
+    nonisolated private static func runShellCommand(path: String, command: String) -> Bool {
+        let escapedPath = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "cd \(escapedPath) && \(command)"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
         }
     }
 
@@ -807,10 +1010,10 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    func stop(projectName: String, silent: Bool = false) {
-        guard let managedProcesses = processesByProject.removeValue(forKey: projectName) else {
-            return
-        }
+    func stop(project: ProjectConfig, allProjects: [ProjectConfig], silent: Bool = false) {
+        let projectName = project.name
+        let managedProcesses = processesByProject.removeValue(forKey: projectName) ?? []
+        let hadManagedProcess = !managedProcesses.isEmpty
 
         for entry in managedProcesses {
             if entry.process.isRunning {
@@ -819,10 +1022,44 @@ final class ProjectRunner: ObservableObject {
             entry.logFileHandle?.closeFile()
         }
 
+        let stopCommandResult = runStopCommandIfNeeded(project: project, allProjects: allProjects)
         runningProjects.remove(projectName)
 
-        if !silent {
+        guard hadManagedProcess || stopCommandResult != .notConfigured else {
+            return
+        }
+
+        if !silent, stopCommandResult == .succeeded {
+            statusMessage = "\(projectName): stopped (종료 스크립트 실행)"
+        } else if !silent, stopCommandResult == .failed {
+            statusMessage = "\(projectName): stopped (종료 스크립트 실패)"
+        } else if !silent {
             statusMessage = "\(projectName): stopped"
+        }
+    }
+
+    private func runStopCommandIfNeeded(project: ProjectConfig, allProjects: [ProjectConfig]) -> StopCommandResult {
+        guard var command = project.stopCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty else {
+            return .notConfigured
+        }
+
+        let port = portForProject(project, in: allProjects)
+        command = command.replacingOccurrences(of: "$PORT", with: String(port))
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "cd \(shellEscape(project.expandedPath)) && \(command)"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0 ? .succeeded : .failed
+        } catch {
+            statusMessage = "\(project.name): 종료 스크립트 실행 실패 (\(error.localizedDescription))"
+            return .failed
         }
     }
 
@@ -1166,6 +1403,7 @@ struct MenuContentView: View {
     @ObservedObject var runner: ProjectRunner
     @ObservedObject var gitStore: GitStatusStore
     @ObservedObject var portStore: PortStatusStore
+    var addProjectController: AddProjectWindowController
 
     private var groupedProjects: [(group: String, projects: [ProjectConfig])] {
         let projects = configStore.projects
@@ -1173,7 +1411,8 @@ struct MenuContentView: View {
         var groupMap: [String: [ProjectConfig]] = [:]
 
         for project in projects {
-            let group = project.group ?? "기타"
+            let normalizedGroup = project.group?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let group = (normalizedGroup?.isEmpty == false) ? normalizedGroup! : "기타"
             if groupMap[group] == nil {
                 groupOrder.append(group)
             }
@@ -1184,147 +1423,384 @@ struct MenuContentView: View {
     }
 
     var body: some View {
-        if configStore.projects.isEmpty {
-            Text("프로젝트 없음")
-        } else {
-            ForEach(Array(groupedProjects.enumerated()), id: \.offset) { index, section in
-                if index > 0 {
+        VStack(alignment: .leading, spacing: 0) {
+            if configStore.projects.isEmpty {
+                Text("프로젝트 없음")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 12)
+            } else {
+                ForEach(Array(groupedProjects.enumerated()), id: \.offset) { index, section in
+                    if index > 0 {
+                        Divider().padding(.vertical, 4)
+                    }
+                    groupHeaderRow(group: section.group, projects: section.projects)
                     Divider()
-                }
-                Text(section.group)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
 
-                ForEach(section.projects) { project in
-                    projectRow(project)
+                    ForEach(section.projects) { project in
+                        projectRow(project)
+                        Divider()
+                    }
                 }
             }
-        }
 
-        Divider()
+            Divider().padding(.vertical, 8)
 
-        Button("▶  전체 실행") {
-            for project in configStore.projects {
-                let port = runner.port(for: project, in: configStore.projects)
-                let alreadyRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
-                if !alreadyRunning {
-                    runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+            utilityButton(
+                title: runner.isBulkCommitRunning ? "전체 커밋 및 푸시 실행 중..." : "전체 커밋 및 푸시",
+                systemName: "arrow.up.circle",
+                disabled: configStore.projects.isEmpty || runner.isBulkCommitRunning
+            ) {
+                runner.runBulkCommitAndPushWithClaude(projects: configStore.projects)
+            }
+
+            utilityButton(title: "프로젝트 추가", systemName: "plus") {
+                addProjectController.showAddProject(configStore: configStore)
+            }
+
+            if !configStore.projects.isEmpty {
+                utilityMenu(title: "프로젝트 설정 제거", systemName: "trash") {
+                    ForEach(configStore.projects) { project in
+                        Button(project.name) {
+                            configStore.confirmAndRemoveProject(named: project.name)
+                        }
+                    }
                 }
             }
-        }
-        .disabled(configStore.projects.isEmpty)
 
-        Button("■  전체 중지") {
-            for project in configStore.projects {
-                runner.stop(projectName: project.name, silent: true)
+            utilityButton(title: "설정 새로고침", systemName: "arrow.clockwise") {
+                configStore.reload()
+                gitStore.refresh(projects: configStore.projects)
             }
-            runner.killListeningPorts(projects: configStore.projects) {
-                portStore.forceRefresh()
+
+            utilityButton(title: "설정 폴더 열기", systemName: "folder") {
+                configStore.openConfigFolder()
             }
-        }
-        .disabled(configStore.projects.isEmpty)
 
-        Button(runner.isBulkCommitRunning ? "전체 커밋 및 푸시 실행 중..." : "전체 커밋 및 푸시") {
-            runner.runBulkCommitAndPushWithClaude(projects: configStore.projects)
-        }
-        .disabled(configStore.projects.isEmpty || runner.isBulkCommitRunning)
-
-        Divider()
-
-        Button("설정 새로고침") {
-            configStore.reload()
-            gitStore.refresh(projects: configStore.projects)
-        }
-
-        Button("설정 폴더 열기") {
-            configStore.openConfigFolder()
-        }
-
-        Menu("에디터: \(configStore.editor.displayName)") {
-            ForEach(EditorType.allCases, id: \.self) { editor in
-                Button("\(configStore.editor == editor ? "✓ " : "   ")\(editor.displayName)") {
-                    configStore.setEditor(editor)
+            utilityMenu(title: "에디터: \(configStore.editor.displayName)", systemName: "chevron.left.forwardslash.chevron.right") {
+                ForEach(EditorType.allCases, id: \.self) { editor in
+                    Button("\(configStore.editor == editor ? "✓ " : "   ")\(editor.displayName)") {
+                        configStore.setEditor(editor)
+                    }
                 }
             }
-        }
 
-        Menu("iTerm 모드: \(configStore.itermMode == .tab ? "탭" : "윈도우")") {
-            Button("\(configStore.itermMode == .tab ? "✓ " : "   ")탭 모드") {
-                configStore.setItermMode(.tab)
+            utilityMenu(title: "iTerm 모드: \(configStore.itermMode == .tab ? "탭" : "윈도우")", systemName: "rectangle.split.2x1") {
+                Button("\(configStore.itermMode == .tab ? "✓ " : "   ")탭 모드") {
+                    configStore.setItermMode(.tab)
+                }
+                Button("\(configStore.itermMode == .window ? "✓ " : "   ")윈도우 모드") {
+                    configStore.setItermMode(.window)
+                }
             }
-            Button("\(configStore.itermMode == .window ? "✓ " : "   ")윈도우 모드") {
-                configStore.setItermMode(.window)
+
+            if let message = runner.statusMessage ?? configStore.statusMessage {
+                Divider().padding(.vertical, 8)
+                Text(message)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+            }
+
+            Divider().padding(.top, 8).padding(.bottom, 6)
+
+            utilityButton(title: "종료", systemName: "xmark.circle") {
+                NSApplication.shared.terminate(nil)
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+    }
 
-        if let message = runner.statusMessage ?? configStore.statusMessage {
-            Divider()
-            Text(message)
-        }
+    private func isProjectRunning(_ project: ProjectConfig) -> Bool {
+        let port = runner.port(for: project, in: configStore.projects)
+        return runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+    }
 
-        Divider()
+    private func runProject(_ project: ProjectConfig) {
+        guard !isProjectRunning(project) else { return }
+        runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+    }
 
-        Button("종료") {
-            NSApplication.shared.terminate(nil)
+    private func runProjects(_ projects: [ProjectConfig]) {
+        for project in projects {
+            runProject(project)
         }
     }
 
-    private func projectLabel(_ project: ProjectConfig) -> String {
-        let port = runner.port(for: project, in: configStore.projects)
-        let isRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
-        let state = gitStore.state(for: project)
-        let dirty = state == .needsCommit ? " ✗" : ""
+    private func stopProjects(_ projects: [ProjectConfig], silent: Bool) {
+        let activeProjects = projects.filter { isProjectRunning($0) }
+        guard !activeProjects.isEmpty else { return }
 
-        if isRunning {
-            return "🟢 \(project.name) :\(String(port))\(dirty)"
-        } else {
-            return "○  \(project.name)\(dirty)"
+        let stopGroup = DispatchGroup()
+
+        for project in activeProjects {
+            runner.stop(project: project, allProjects: configStore.projects, silent: silent)
+            let port = runner.port(for: project, in: configStore.projects)
+            stopGroup.enter()
+            runner.killPort(port, projectPath: project.expandedPath) {
+                stopGroup.leave()
+            }
         }
+
+        stopGroup.notify(queue: .main) {
+            portStore.forceRefresh()
+        }
+    }
+
+    @ViewBuilder
+    private func utilityButton(
+        title: String,
+        systemName: String,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            utilityRowLabel(title: title, systemName: systemName, showsChevron: false)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.5 : 1.0)
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func utilityMenu<Content: View>(
+        title: String,
+        systemName: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Menu {
+            content()
+        } label: {
+            utilityRowLabel(title: title, systemName: systemName, showsChevron: true)
+        }
+        .menuStyle(.borderlessButton)
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func utilityRowLabel(
+        title: String,
+        systemName: String,
+        showsChevron: Bool
+    ) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 16, height: 16)
+                .foregroundStyle(Color.accentColor)
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if showsChevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func iconActionButton(
+        systemName: String,
+        helpText: String,
+        tint: Color,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 24, height: 24)
+                .foregroundStyle(disabled ? Color.secondary : tint)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(disabled ? Color(nsColor: .controlBackgroundColor).opacity(0.4) : tint.opacity(0.18))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(disabled ? Color.clear : tint.opacity(0.35), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .help(helpText)
+        .accessibilityLabel(Text(helpText))
+    }
+
+    @ViewBuilder
+    private func iconMenuButton<Content: View>(
+        systemName: String,
+        helpText: String,
+        tint: Color,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        Menu {
+            content()
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 24, height: 24)
+                .foregroundStyle(tint)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(tint.opacity(0.18))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .stroke(tint.opacity(0.35), lineWidth: 1)
+                )
+        }
+        .menuStyle(.borderlessButton)
+        .help(helpText)
+        .accessibilityLabel(Text(helpText))
+    }
+
+    @ViewBuilder
+    private func groupEditButton(group: String, projects: [ProjectConfig]) -> some View {
+        iconMenuButton(systemName: "pencil", helpText: "\(group) 그룹 수정", tint: .secondary) {
+            ForEach(projects) { project in
+                Button(project.name) {
+                    addProjectController.showEditProject(project: project, configStore: configStore)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func runStopButton(
+        isRunning: Bool,
+        runLabel: String,
+        stopLabel: String,
+        runAction: @escaping () -> Void,
+        stopAction: @escaping () -> Void
+    ) -> some View {
+        if isRunning {
+            iconActionButton(systemName: "stop.fill", helpText: stopLabel, tint: .red, action: stopAction)
+        } else {
+            iconActionButton(systemName: "play.fill", helpText: runLabel, tint: .blue, action: runAction)
+        }
+    }
+
+    @ViewBuilder
+    private func groupHeaderRow(group: String, projects: [ProjectConfig]) -> some View {
+        let hasRunning = projects.contains { isProjectRunning($0) }
+        let hasStopped = projects.contains { !isProjectRunning($0) }
+        let showStop = hasRunning
+
+        HStack(spacing: 8) {
+            Text(group)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.secondary)
+                .textCase(.uppercase)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            runStopButton(
+                isRunning: showStop,
+                runLabel: "\(group) 그룹 실행",
+                stopLabel: "\(group) 그룹 중지",
+                runAction: { runProjects(projects.filter { !isProjectRunning($0) }) },
+                stopAction: { stopProjects(projects, silent: true) }
+            )
+            groupEditButton(group: group, projects: projects)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .opacity((hasRunning || hasStopped) ? 1 : 0.8)
     }
 
     @ViewBuilder
     private func projectRow(_ project: ProjectConfig) -> some View {
         let port = runner.port(for: project, in: configStore.projects)
-        let isRunning = runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+        let isRunning = isProjectRunning(project)
+        let needsCommit = gitStore.state(for: project) == .needsCommit
 
-        Menu(projectLabel(project)) {
-            Button("▶  실행") {
-                runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+        HStack(spacing: 8) {
+            Circle()
+                .fill(isRunning ? Color.green : Color.secondary.opacity(0.7))
+                .frame(width: 8, height: 8)
+
+            Text(project.name)
+                .font(.system(size: 15, weight: .semibold))
+                .lineLimit(1)
+                .foregroundStyle(isRunning ? Color.primary : Color.secondary)
+
+            Text(":\(port)")
+                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            if needsCommit {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.orange)
             }
 
-            Button("↗  코드 (\(configStore.editor.displayName))") {
-                runner.openInEditor(project: project, editor: configStore.editor)
-            }
+            Spacer(minLength: 8)
 
-            Button(runner.commitPushProjectsLaunching.contains(project.name) ? "⏳ 실행 중..." : "⬆  커밋 & 푸시") {
-                runner.runProjectCommitAndPushWithClaude(project: project)
-            }
-            .disabled(runner.commitPushProjectsLaunching.contains(project.name))
-
-            if isRunning {
-                Divider()
-                Button("■  중지") {
-                    runner.stop(projectName: project.name)
-                    runner.killPort(port, projectPath: project.expandedPath) {
-                        portStore.forceRefresh()
-                    }
+            HStack(spacing: 4) {
+                runStopButton(
+                    isRunning: isRunning,
+                    runLabel: "\(project.name) 실행",
+                    stopLabel: "\(project.name) 중지",
+                    runAction: { runProject(project) },
+                    stopAction: { stopProjects([project], silent: false) }
+                )
+                iconActionButton(systemName: "pencil", helpText: "\(project.name) 수정", tint: .secondary) {
+                    addProjectController.showEditProject(project: project, configStore: configStore)
                 }
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(
+                    isRunning
+                        ? Color(nsColor: .systemGreen).opacity(0.15)
+                        : Color(nsColor: .controlBackgroundColor).opacity(0.3)
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(
+                    isRunning
+                        ? Color(nsColor: .systemGreen).opacity(0.33)
+                        : Color(nsColor: .separatorColor).opacity(0.2),
+                    lineWidth: 1
+                )
+        )
     }
 }
 
-@main
 struct MultiDevCtrlApp: App {
     @StateObject private var configStore = ConfigStore()
     @StateObject private var runner = ProjectRunner()
     @StateObject private var gitStore = GitStatusStore()
     @StateObject private var portStore = PortStatusStore()
     @State private var didSetup = false
+    private let addProjectController = AddProjectWindowController()
 
     var body: some Scene {
         MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
-            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore, portStore: portStore)
+            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore, portStore: portStore, addProjectController: addProjectController)
+                .frame(width: 520)
                 .onAppear {
                     guard !didSetup else { return }
                     didSetup = true
@@ -1336,6 +1812,8 @@ struct MultiDevCtrlApp: App {
                     gitStore.refresh(projects: projects)
                 }
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
     }
 }
+
+MultiDevCtrlApp.main()

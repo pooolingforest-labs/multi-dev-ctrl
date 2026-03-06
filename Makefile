@@ -4,7 +4,7 @@ APP_DIR = /Applications/$(APP_NAME).app
 CONTENTS = $(APP_DIR)/Contents
 MACOS = $(CONTENTS)/MacOS
 
-.PHONY: build install uninstall
+.PHONY: build install uninstall run
 
 build:
 	swift build -c release
@@ -33,6 +33,13 @@ install: build
 	@echo ""
 	@echo "To auto-launch on login:"
 	@echo "  System Settings > General > Login Items > add MultiDevCtrl"
+
+run:
+	@echo "Stopping running instances..."
+	@pkill -f "multi-dev-ctrl" 2>/dev/null || true
+	@pkill -f "$(APP_NAME)" 2>/dev/null || true
+	@sleep 0.5
+	swift build && swift run
 
 uninstall:
 	@echo "Stopping $(APP_NAME)..."
