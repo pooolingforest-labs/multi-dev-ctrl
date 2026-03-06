@@ -38,6 +38,7 @@ struct AppConfig: Codable {
 struct ProjectConfig: Codable, Identifiable, Equatable {
     let name: String
     let path: String
+    let port: Int?
     let actions: [ProjectAction]
     let group: String?
     let stopCommand: String?
@@ -48,13 +49,14 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, actions, group, stopCommand
+        case name, path, port, actions, group, stopCommand
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
         path = try container.decode(String.self, forKey: .path)
+        port = try container.decodeIfPresent(Int.self, forKey: .port)
         actions = try container.decode([ProjectAction].self, forKey: .actions)
         group = try container.decodeIfPresent(String.self, forKey: .group)
         stopCommand = try container.decodeIfPresent(String.self, forKey: .stopCommand)
@@ -382,13 +384,19 @@ final class ProjectRunner: ObservableObject {
     private var processesByProject: [String: [ManagedProcess]] = [:]
     private var terminalWindowIDsByProject: [String: Int] = [:]
     private var dependencyInstallInProgressProjects: Set<String> = []
-    private func portForProject(_ project: ProjectConfig, in projects: [ProjectConfig]) -> Int {
-        let index = projects.firstIndex(where: { $0.name == project.name }) ?? 0
-        return 3000 + index
+    private var runtimePortsByProject: [String: Int] = [:]
+    private let fallbackPortStart = 3000
+
+    func runtimePort(for project: ProjectConfig) -> Int? {
+        runtimePortsByProject[project.name]
     }
 
-    func port(for project: ProjectConfig, in projects: [ProjectConfig]) -> Int {
-        portForProject(project, in: projects)
+    func port(for project: ProjectConfig, in _: [ProjectConfig]) -> Int? {
+        if let runtimePort = runtimePortsByProject[project.name] {
+            return runtimePort
+        }
+
+        return preferredPortForProject(project)
     }
 
     private var logsDirectory: URL {
@@ -397,7 +405,67 @@ final class ProjectRunner: ObservableObject {
             .appendingPathComponent("logs", isDirectory: true)
     }
 
-    func run(_ project: ProjectConfig, allProjects: [ProjectConfig], itermMode: ItermMode = .window) {
+    private func projectRequiresRuntimePort(_ project: ProjectConfig) -> Bool {
+        project.actions.contains { $0.type != .openApp } || (project.stopCommand?.contains("$PORT") ?? false)
+    }
+
+    private func resolvePortForRun(_ project: ProjectConfig) -> (port: Int, preferred: Int?, wasReassigned: Bool) {
+        let preferred = preferredPortForProject(project)
+        let unavailable = unavailablePorts(excludingProjectName: project.name)
+
+        if let preferred, !unavailable.contains(preferred) {
+            runtimePortsByProject[project.name] = preferred
+            return (preferred, preferred, false)
+        }
+
+        if let existing = runtimePortsByProject[project.name], !unavailable.contains(existing) {
+            return (existing, preferred, false)
+        }
+
+        let start = max(
+            fallbackPortStart,
+            (preferred ?? runtimePortsByProject[project.name] ?? fallbackPortStart) + (preferred == nil ? 0 : 1)
+        )
+
+        let selected = findAvailablePort(startingAt: start, unavailable: unavailable)
+            ?? findAvailablePort(startingAt: fallbackPortStart, unavailable: unavailable)
+            ?? (preferred ?? fallbackPortStart)
+
+        runtimePortsByProject[project.name] = selected
+        return (selected, preferred, preferred != nil && preferred != selected)
+    }
+
+    private func unavailablePorts(excludingProjectName: String? = nil) -> Set<Int> {
+        var ports = checkListeningPorts()
+
+        for (projectName, port) in runtimePortsByProject where projectName != excludingProjectName {
+            ports.insert(port)
+        }
+
+        return ports
+    }
+
+    private func findAvailablePort(startingAt startPort: Int, unavailable: Set<Int>) -> Int? {
+        let minPort = 1024
+        let maxPort = 65535
+        let start = min(max(startPort, minPort), maxPort)
+
+        if start <= maxPort {
+            for port in start...maxPort where !unavailable.contains(port) {
+                return port
+            }
+        }
+
+        if minPort < start {
+            for port in minPort..<(start) where !unavailable.contains(port) {
+                return port
+            }
+        }
+
+        return nil
+    }
+
+    func run(_ project: ProjectConfig, allProjects _: [ProjectConfig], itermMode: ItermMode = .window) {
         let hasRunningProcess = hasRunningProcesses(projectName: project.name)
 
         if hasRunningProcess || hasTerminalAction(project: project) {
@@ -417,19 +485,25 @@ final class ProjectRunner: ObservableObject {
             return
         }
 
-        autoInstallDependenciesIfNeeded(project: project, allProjects: allProjects) { [weak self] installSuccess in
+        let resolvedPort = projectRequiresRuntimePort(project) ? resolvePortForRun(project) : nil
+        if let resolvedPort, resolvedPort.wasReassigned, let preferred = resolvedPort.preferred {
+            statusMessage = "\(project.name): \(preferred) 포트가 사용 중이라 \(resolvedPort.port)로 실행합니다"
+        }
+
+        autoInstallDependenciesIfNeeded(project: project, runtimePort: resolvedPort?.port) { [weak self] installSuccess in
             guard let self else { return }
-            guard installSuccess else { return }
-            self.executeProjectActions(project, allProjects: allProjects, itermMode: itermMode)
+            guard installSuccess else {
+                self.runtimePortsByProject.removeValue(forKey: project.name)
+                return
+            }
+            self.executeProjectActions(project, runtimePort: resolvedPort?.port, itermMode: itermMode)
         }
     }
 
-    private func executeProjectActions(_ project: ProjectConfig, allProjects: [ProjectConfig], itermMode: ItermMode) {
+    private func executeProjectActions(_ project: ProjectConfig, runtimePort: Int?, itermMode: ItermMode) {
         var startedBackgroundProcess = false
         let projectMarker = markerForProject(project.name)
         let projectTitle = project.name
-        let port = portForProject(project, in: allProjects)
-        let portStr = String(port)
 
         for action in project.actions {
             switch action.type {
@@ -438,7 +512,9 @@ final class ProjectRunner: ObservableObject {
                     statusMessage = "\(project.name): runCommand requires a command"
                     continue
                 }
-                command = command.replacingOccurrences(of: "$PORT", with: portStr)
+                if let runtimePort {
+                    command = commandWithRuntimePort(command, runtimePort: runtimePort)
+                }
 
                 do {
                     try launchBackgroundCommand(projectName: project.name, path: project.expandedPath, command: command)
@@ -449,7 +525,9 @@ final class ProjectRunner: ObservableObject {
 
             case .openIterm:
                 var command = action.command
-                command = command?.replacingOccurrences(of: "$PORT", with: portStr)
+                if let runtimePort, let rawCommand = command {
+                    command = commandWithRuntimePort(rawCommand, runtimePort: runtimePort)
+                }
                 if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle, mode: itermMode) {
                     if windowID > 0 {
                         terminalWindowIDsByProject[project.name] = windowID
@@ -460,7 +538,12 @@ final class ProjectRunner: ObservableObject {
                 }
 
             case .openItermSplit:
-                let commands = normalizedCommands(action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: portStr) })
+                let commands = normalizedCommands(action.commands?.map {
+                    if let runtimePort {
+                        return commandWithRuntimePort($0, runtimePort: runtimePort)
+                    }
+                    return $0
+                })
                 guard commands.count >= 2 else {
                     statusMessage = "\(project.name): openItermSplit requires at least 2 commands"
                     continue
@@ -497,10 +580,10 @@ final class ProjectRunner: ObservableObject {
 
     private func autoInstallDependenciesIfNeeded(
         project: ProjectConfig,
-        allProjects: [ProjectConfig],
+        runtimePort: Int?,
         completion: @escaping (Bool) -> Void
     ) {
-        guard let installCommand = installCommandIfNeeded(project: project, allProjects: allProjects) else {
+        guard let installCommand = installCommandIfNeeded(project: project, runtimePort: runtimePort) else {
             completion(true)
             return
         }
@@ -527,14 +610,14 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    private func installCommandIfNeeded(project: ProjectConfig, allProjects: [ProjectConfig]) -> String? {
+    private func installCommandIfNeeded(project: ProjectConfig, runtimePort: Int?) -> String? {
         let projectRoot = URL(fileURLWithPath: project.expandedPath, isDirectory: true)
         let packageJSONPath = projectRoot.appendingPathComponent("package.json").path
         guard fileManager.fileExists(atPath: packageJSONPath) else {
             return nil
         }
 
-        let commands = commandsNeedingPreparation(project: project, allProjects: allProjects)
+        let commands = commandsNeedingPreparation(project: project, runtimePort: runtimePort)
         guard commands.contains(where: shouldAutoInstallDependencies) else {
             return nil
         }
@@ -542,29 +625,28 @@ final class ProjectRunner: ObservableObject {
         return preferredNodePackageManager(for: commands, in: projectRoot).installCommand
     }
 
-    private func commandsNeedingPreparation(project: ProjectConfig, allProjects: [ProjectConfig]) -> [String] {
-        let portStr = String(portForProject(project, in: allProjects))
+    private func commandsNeedingPreparation(project: ProjectConfig, runtimePort: Int?) -> [String] {
         var commands: [String] = []
 
         for action in project.actions {
             switch action.type {
             case .runCommand:
                 if let command = action.command?
-                    .replacingOccurrences(of: "$PORT", with: portStr)
+                    .replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT")
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                    !command.isEmpty {
                     commands.append(command)
                 }
             case .openIterm:
                 if let command = action.command?
-                    .replacingOccurrences(of: "$PORT", with: portStr)
+                    .replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT")
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                    !command.isEmpty {
                     commands.append(command)
                 }
             case .openItermSplit:
                 let splitCommands = normalizedCommands(
-                    action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: portStr) }
+                    action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT") }
                 )
                 commands.append(contentsOf: splitCommands)
             case .openApp:
@@ -573,6 +655,291 @@ final class ProjectRunner: ObservableObject {
         }
 
         return commands
+    }
+
+    private func commandWithRuntimePort(_ command: String, runtimePort: Int) -> String {
+        var rewritten = replacePortPlaceholder(in: command, runtimePort: runtimePort)
+
+        // Best-effort override for common explicit port flags when fallback ports are used.
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "(--port(?:\\s*=\\s*|\\s+))\\d{1,5}",
+            with: "$1\(runtimePort)"
+        )
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "((?:^|\\s)-p\\s*)\\d{1,5}(\\b)",
+            with: "$1\(runtimePort)$2"
+        )
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "((?:^|\\s)-p)\\d{1,5}(\\b)",
+            with: "$1\(runtimePort)$2"
+        )
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "((?:^|\\s)PORT\\s*=\\s*)\\d{1,5}(\\b)",
+            with: "$1\(runtimePort)$2"
+        )
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "(runserver(?:\\s+\\S+)?:)\\d{1,5}(\\b)",
+            with: "$1\(runtimePort)$2"
+        )
+        rewritten = replacingRegex(
+            in: rewritten,
+            pattern: "(runserver\\s+)\\d{1,5}(\\b)",
+            with: "$1\(runtimePort)$2"
+        )
+
+        if !containsRegex(in: rewritten, pattern: "(?:^|\\s)PORT\\s*=") {
+            rewritten = "PORT=\(runtimePort) \(rewritten)"
+        }
+
+        return rewritten
+    }
+
+    private func replacePortPlaceholder(in command: String, runtimePort: Int?) -> String {
+        command.replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT")
+    }
+
+    private func preferredPortForProject(_ project: ProjectConfig) -> Int? {
+        if let configuredPort = project.port, isValidPort(configuredPort) {
+            return configuredPort
+        }
+
+        if let actionPort = firstPortFromProjectCommands(project) {
+            return actionPort
+        }
+
+        if let envPort = portFromDotEnvFiles(projectRootPath: project.expandedPath) {
+            return envPort
+        }
+
+        if let scriptPort = portFromPackageScripts(project) {
+            return scriptPort
+        }
+
+        return nil
+    }
+
+    private func firstPortFromProjectCommands(_ project: ProjectConfig) -> Int? {
+        for command in actionCommands(project.actions) {
+            if let port = extractPort(from: command) {
+                return port
+            }
+        }
+
+        return nil
+    }
+
+    private func actionCommands(_ actions: [ProjectAction]) -> [String] {
+        var commands: [String] = []
+
+        for action in actions {
+            switch action.type {
+            case .runCommand, .openIterm:
+                if let command = action.command?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !command.isEmpty {
+                    commands.append(command)
+                }
+            case .openItermSplit:
+                commands.append(
+                    contentsOf: normalizedCommands(action.commands?.map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    })
+                )
+            case .openApp:
+                continue
+            }
+        }
+
+        return commands
+    }
+
+    private func portFromDotEnvFiles(projectRootPath: String) -> Int? {
+        let projectRoot = URL(fileURLWithPath: projectRootPath, isDirectory: true)
+        let envFileNames = [
+            ".env",
+            ".env.local",
+            ".env.development",
+            ".env.development.local"
+        ]
+
+        for envFileName in envFileNames {
+            let envFilePath = projectRoot.appendingPathComponent(envFileName).path
+            guard fileManager.fileExists(atPath: envFilePath),
+                  let content = try? String(contentsOfFile: envFilePath, encoding: .utf8) else {
+                continue
+            }
+
+            for line in content.split(separator: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || trimmed.hasPrefix("#") {
+                    continue
+                }
+
+                if let value = firstMatch(in: trimmed, pattern: "^PORT\\s*=\\s*\"?(\\d{1,5})\"?$"),
+                   let port = Int(value),
+                   isValidPort(port) {
+                    return port
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func portFromPackageScripts(_ project: ProjectConfig) -> Int? {
+        let packageJSONPath = URL(fileURLWithPath: project.expandedPath, isDirectory: true)
+            .appendingPathComponent("package.json")
+            .path
+
+        guard fileManager.fileExists(atPath: packageJSONPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: packageJSONPath)),
+              let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let scripts = decoded["scripts"] as? [String: String] else {
+            return nil
+        }
+
+        for command in actionCommands(project.actions) {
+            guard let scriptName = scriptNameFromRunCommand(command),
+                  let script = scripts[scriptName],
+                  let port = extractPort(from: script) else {
+                continue
+            }
+
+            return port
+        }
+
+        return nil
+    }
+
+    private func scriptNameFromRunCommand(_ command: String) -> String? {
+        let patterns = [
+            "(?:^|\\s)npm\\s+run\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)pnpm\\s+run\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)pnpm\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)yarn\\s+run\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)yarn\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)bun\\s+run\\s+([\\w:-]+)(?:\\s|$)",
+            "(?:^|\\s)bun\\s+([\\w:-]+)(?:\\s|$)"
+        ]
+
+        for pattern in patterns {
+            guard let script = firstMatch(in: command, pattern: pattern) else {
+                continue
+            }
+
+            if script.hasPrefix("-") {
+                continue
+            }
+
+            return script
+        }
+
+        return nil
+    }
+
+    private func extractPort(from command: String) -> Int? {
+        let patterns = [
+            "(?:^|\\s)PORT\\s*=\\s*(\\d{1,5})(?:\\b|\\s|$)",
+            "(?:--port|--http-port|--server-port|--listen-port|--dev-port|--bind-port)(?:\\s*=\\s*|\\s+)(\\d{1,5})(?:\\b|\\s|$)",
+            "(?:^|\\s)-p\\s*(\\d{1,5})(?:\\b|\\s|$)",
+            "(?:^|\\s)-p(\\d{1,5})(?:\\b|\\s|$)",
+            "runserver(?:\\s+\\S+)?:(\\d{1,5})(?:\\b|\\s|$)",
+            "runserver\\s+(\\d{1,5})(?:\\b|\\s|$)",
+            "localhost:(\\d{1,5})(?:\\b|\\s|$)"
+        ]
+
+        for pattern in patterns {
+            guard let match = firstMatch(in: command, pattern: pattern),
+                  let port = Int(match),
+                  isValidPort(port) else {
+                continue
+            }
+
+            return port
+        }
+
+        return nil
+    }
+
+    private func isValidPort(_ port: Int) -> Bool {
+        (1...65535).contains(port)
+    }
+
+    private func firstMatch(in value: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        guard let match = regex.firstMatch(in: value, options: [], range: range),
+              match.numberOfRanges > 1,
+              let matchedRange = Range(match.range(at: 1), in: value) else {
+            return nil
+        }
+
+        return String(value[matchedRange])
+    }
+
+    private func containsRegex(in value: String, pattern: String) -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return false
+        }
+
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return regex.firstMatch(in: value, options: [], range: range) != nil
+    }
+
+    private func replacingRegex(in value: String, pattern: String, with template: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return value
+        }
+
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return regex.stringByReplacingMatches(in: value, options: [], range: range, withTemplate: template)
+    }
+
+    private func checkListeningPorts() -> Set<Int> {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-iTCP", "-sTCP:LISTEN", "-nP", "-Fn"]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return []
+        }
+
+        guard process.terminationStatus == 0 else {
+            return []
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        var ports = Set<Int>()
+        for line in output.split(separator: "\n") {
+            guard line.hasPrefix("n"), let colonIdx = line.lastIndex(of: ":") else {
+                continue
+            }
+
+            let portString = line[line.index(after: colonIdx)...]
+            if let port = Int(portString), isValidPort(port) {
+                ports.insert(port)
+            }
+        }
+
+        return ports
     }
 
     private func shouldAutoInstallDependencies(command: String) -> Bool {
@@ -995,7 +1362,9 @@ final class ProjectRunner: ObservableObject {
     func killListeningPorts(projects: [ProjectConfig], completion: (() -> Void)? = nil) {
         let group = DispatchGroup()
         for project in projects {
-            let port = portForProject(project, in: projects)
+            guard let port = port(for: project, in: projects) else {
+                continue
+            }
             group.enter()
             killPort(port, projectPath: project.expandedPath) {
                 group.leave()
@@ -1010,7 +1379,7 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    func stop(project: ProjectConfig, allProjects: [ProjectConfig], silent: Bool = false) {
+    func stop(project: ProjectConfig, allProjects _: [ProjectConfig], silent: Bool = false) {
         let projectName = project.name
         let managedProcesses = processesByProject.removeValue(forKey: projectName) ?? []
         let hadManagedProcess = !managedProcesses.isEmpty
@@ -1022,8 +1391,9 @@ final class ProjectRunner: ObservableObject {
             entry.logFileHandle?.closeFile()
         }
 
-        let stopCommandResult = runStopCommandIfNeeded(project: project, allProjects: allProjects)
+        let stopCommandResult = runStopCommandIfNeeded(project: project)
         runningProjects.remove(projectName)
+        runtimePortsByProject.removeValue(forKey: projectName)
 
         guard hadManagedProcess || stopCommandResult != .notConfigured else {
             return
@@ -1038,14 +1408,14 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    private func runStopCommandIfNeeded(project: ProjectConfig, allProjects: [ProjectConfig]) -> StopCommandResult {
+    private func runStopCommandIfNeeded(project: ProjectConfig) -> StopCommandResult {
         guard var command = project.stopCommand?.trimmingCharacters(in: .whitespacesAndNewlines),
               !command.isEmpty else {
             return .notConfigured
         }
 
-        let port = portForProject(project, in: allProjects)
-        command = command.replacingOccurrences(of: "$PORT", with: String(port))
+        let runtimePort = runtimePortsByProject[project.name] ?? preferredPortForProject(project)
+        command = replacePortPlaceholder(in: command, runtimePort: runtimePort)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -1109,6 +1479,7 @@ final class ProjectRunner: ObservableObject {
         if managedProcesses.isEmpty {
             processesByProject.removeValue(forKey: projectName)
             runningProjects.remove(projectName)
+            runtimePortsByProject.removeValue(forKey: projectName)
             statusMessage = "\(projectName): process exited"
         } else {
             processesByProject[projectName] = managedProcesses
@@ -1518,8 +1889,15 @@ struct MenuContentView: View {
     }
 
     private func isProjectRunning(_ project: ProjectConfig) -> Bool {
-        let port = runner.port(for: project, in: configStore.projects)
-        return runner.runningProjects.contains(project.name) || portStore.isPortListening(port)
+        if runner.runningProjects.contains(project.name) {
+            return true
+        }
+
+        guard let port = runner.port(for: project, in: configStore.projects) else {
+            return false
+        }
+
+        return portStore.isPortListening(port)
     }
 
     private func runProject(_ project: ProjectConfig) {
@@ -1540,11 +1918,13 @@ struct MenuContentView: View {
         let stopGroup = DispatchGroup()
 
         for project in activeProjects {
+            let portToKill = runner.runtimePort(for: project) ?? runner.port(for: project, in: configStore.projects)
             runner.stop(project: project, allProjects: configStore.projects, silent: silent)
-            let port = runner.port(for: project, in: configStore.projects)
-            stopGroup.enter()
-            runner.killPort(port, projectPath: project.expandedPath) {
-                stopGroup.leave()
+            if let portToKill {
+                stopGroup.enter()
+                runner.killPort(portToKill, projectPath: project.expandedPath) {
+                    stopGroup.leave()
+                }
             }
         }
 
@@ -1742,9 +2122,11 @@ struct MenuContentView: View {
                 .lineLimit(1)
                 .foregroundStyle(isRunning ? Color.primary : Color.secondary)
 
-            Text(":\(port)")
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.secondary)
+            if let port {
+                Text(":\(port)")
+                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
 
             if needsCommit {
                 Image(systemName: "exclamationmark.circle.fill")
