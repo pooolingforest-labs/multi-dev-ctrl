@@ -45,6 +45,7 @@ final class AddProjectState: ObservableObject {
     @Published var customCommand = ""
     @Published var scriptFileURL: URL?
     @Published var stopScriptFileURL: URL?
+    @Published var isEnabled = true
 
     @Published var isEditMode = false
     var originalName: String?
@@ -71,6 +72,7 @@ final class AddProjectState: ObservableObject {
         originalName = project.name
         projectName = project.name
         projectPath = URL(fileURLWithPath: project.expandedPath)
+        isEnabled = project.isEnabled
 
         if let group = project.group?.trimmingCharacters(in: .whitespacesAndNewlines), !group.isEmpty {
             selectedGroup = group
@@ -127,7 +129,8 @@ final class AddProjectState: ObservableObject {
     func buildProjectConfig() -> [String: Any] {
         var dict: [String: Any] = [
             "name": projectName.trimmingCharacters(in: .whitespacesAndNewlines),
-            "path": projectPath?.path ?? ""
+            "path": projectPath?.path ?? "",
+            "isEnabled": isEnabled
         ]
 
         if let group = resolvedGroup {

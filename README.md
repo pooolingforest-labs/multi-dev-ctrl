@@ -4,6 +4,7 @@ macOS 메뉴바에서 프로젝트별 개발 환경을 원클릭으로 실행하
 
 ## 기능
 - 메뉴바에서 프로젝트 이름 클릭으로 사전 정의된 액션 일괄 실행
+- 그룹별 프로젝트 비활성화(아카이브) 및 별도 복구 UI
 - `runCommand`: 백그라운드에서 개발 서버 실행 (예: `npm run dev`)
 - `openIterm`: iTerm 탭/창 열기 (선택적으로 명령 실행)
 - `openItermSplit`: iTerm 한 탭을 2분할로 열고 명령 2개 동시 실행
@@ -36,6 +37,7 @@ swift run
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "isEnabled": true,
       "actions": [
         {
           "type": "openItermSplit",
@@ -53,6 +55,7 @@ swift run
 3. Set:
    - `name`: menu label
    - `path`: absolute project path
+   - `isEnabled`: whether the project can be launched (`true` by default)
    - `actions`: what to run when clicked
 4. Save the file, then click `Reload Config` in the menu bar app.
 
@@ -63,6 +66,7 @@ Example:
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "isEnabled": true,
       "actions": [
         {
           "type": "openItermSplit",
@@ -90,6 +94,7 @@ Example:
 3. 아래 값을 설정합니다.
    - `name`: 메뉴바에 보일 이름
    - `path`: 프로젝트 절대 경로
+   - `isEnabled`: 실행 가능 여부 (`true` 기본값)
    - `actions`: 클릭 시 실행할 동작 목록
 4. 저장 후 메뉴바 앱에서 `Reload Config`를 누릅니다.
 
@@ -100,6 +105,7 @@ Example:
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "isEnabled": true,
       "actions": [
         {
           "type": "openItermSplit",
@@ -135,6 +141,13 @@ Example:
 - `openApp`
   - 필수: `appName`
   - `open -a <appName>` 형태로 실행
+
+### 프로젝트 활성/비활성
+- `isEnabled`가 없으면 기본값은 `true`입니다.
+- `isEnabled: false`인 프로젝트는 메인 메뉴 목록에 표시되지 않습니다.
+- `전체 실행`, 그룹 실행, 전체 커밋/푸시 대상에서도 제외됩니다.
+- 메인 화면에서는 그룹 단위로만 비활성화할 수 있습니다.
+- 비활성 프로젝트는 `비활성 프로젝트 관리` UI에서 개별 또는 그룹 단위로 복구할 수 있습니다.
 
 ## 로그
 - 백그라운드 명령 로그: `~/.multi-dev-ctrl/logs/<project>.log`

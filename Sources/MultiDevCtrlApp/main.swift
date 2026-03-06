@@ -42,6 +42,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     let actions: [ProjectAction]
     let group: String?
     let stopCommand: String?
+    let isEnabled: Bool
     var id: String { name }
 
     var expandedPath: String {
@@ -49,7 +50,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, port, actions, group, stopCommand
+        case name, path, port, actions, group, stopCommand, isEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -60,6 +61,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
         actions = try container.decode([ProjectAction].self, forKey: .actions)
         group = try container.decodeIfPresent(String.self, forKey: .group)
         stopCommand = try container.decodeIfPresent(String.self, forKey: .stopCommand)
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
     }
 }
 
@@ -466,6 +468,11 @@ final class ProjectRunner: ObservableObject {
     }
 
     func run(_ project: ProjectConfig, allProjects _: [ProjectConfig], itermMode: ItermMode = .window) {
+        guard project.isEnabled else {
+            statusMessage = "\(project.name): 비활성 프로젝트라 실행하지 않습니다"
+            return
+        }
+
         let hasRunningProcess = hasRunningProcesses(projectName: project.name)
 
         if hasRunningProcess || hasTerminalAction(project: project) {
@@ -1775,15 +1782,15 @@ struct MenuContentView: View {
     @ObservedObject var gitStore: GitStatusStore
     @ObservedObject var portStore: PortStatusStore
     var addProjectController: AddProjectWindowController
+    var archivedProjectsController: ArchivedProjectsWindowController
 
     private var groupedProjects: [(group: String, projects: [ProjectConfig])] {
-        let projects = configStore.projects
+        let projects = configStore.enabledProjects
         var groupOrder: [String] = []
         var groupMap: [String: [ProjectConfig]] = [:]
 
         for project in projects {
-            let normalizedGroup = project.group?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let group = (normalizedGroup?.isEmpty == false) ? normalizedGroup! : "기타"
+            let group = configStore.displayGroupName(for: project)
             if groupMap[group] == nil {
                 groupOrder.append(group)
             }
@@ -1794,6 +1801,9 @@ struct MenuContentView: View {
     }
 
     var body: some View {
+        let enabledProjects = configStore.enabledProjects
+        let allProjectsRunning = !enabledProjects.isEmpty && enabledProjects.allSatisfy { isProjectRunning($0) }
+
         VStack(alignment: .leading, spacing: 0) {
             if configStore.projects.isEmpty {
                 Text("프로젝트 없음")
@@ -1802,6 +1812,17 @@ struct MenuContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 12)
+            } else if groupedProjects.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("활성 프로젝트 없음")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("비활성 프로젝트 관리에서 복구할 수 있습니다.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 12)
             } else {
                 ForEach(Array(groupedProjects.enumerated()), id: \.offset) { index, section in
                     if index > 0 {
@@ -1820,24 +1841,36 @@ struct MenuContentView: View {
             Divider().padding(.vertical, 8)
 
             utilityButton(
+                title: allProjectsRunning ? "전체 종료" : "전체 실행",
+                systemName: allProjectsRunning ? "stop.circle" : "play.circle",
+                disabled: enabledProjects.isEmpty
+            ) {
+                if allProjectsRunning {
+                    stopProjects(configStore.projects, silent: true)
+                } else {
+                    runProjects(enabledProjects.filter { !isProjectRunning($0) })
+                }
+            }
+
+            utilityButton(
                 title: runner.isBulkCommitRunning ? "전체 커밋 및 푸시 실행 중..." : "전체 커밋 및 푸시",
                 systemName: "arrow.up.circle",
-                disabled: configStore.projects.isEmpty || runner.isBulkCommitRunning
+                disabled: enabledProjects.isEmpty || runner.isBulkCommitRunning
             ) {
-                runner.runBulkCommitAndPushWithClaude(projects: configStore.projects)
+                runner.runBulkCommitAndPushWithClaude(projects: enabledProjects)
             }
 
             utilityButton(title: "프로젝트 추가", systemName: "plus") {
                 addProjectController.showAddProject(configStore: configStore)
             }
 
+            utilityButton(title: "비활성 프로젝트 관리", systemName: "archivebox") {
+                archivedProjectsController.show(configStore: configStore)
+            }
+
             if !configStore.projects.isEmpty {
-                utilityMenu(title: "프로젝트 설정 제거", systemName: "trash") {
-                    ForEach(configStore.projects) { project in
-                        Button(project.name) {
-                            configStore.confirmAndRemoveProject(named: project.name)
-                        }
-                    }
+                utilityButton(title: "프로젝트 설정 제거", systemName: "trash") {
+                    configStore.promptAndRemoveProject()
                 }
             }
 
@@ -1901,19 +1934,27 @@ struct MenuContentView: View {
     }
 
     private func runProject(_ project: ProjectConfig) {
+        guard project.isEnabled || isProjectRunning(project) else {
+            runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+            return
+        }
+
         guard !isProjectRunning(project) else { return }
         runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
     }
 
     private func runProjects(_ projects: [ProjectConfig]) {
-        for project in projects {
+        for project in projects where project.isEnabled {
             runProject(project)
         }
     }
 
-    private func stopProjects(_ projects: [ProjectConfig], silent: Bool) {
+    private func stopProjects(_ projects: [ProjectConfig], silent: Bool, completion: (() -> Void)? = nil) {
         let activeProjects = projects.filter { isProjectRunning($0) }
-        guard !activeProjects.isEmpty else { return }
+        guard !activeProjects.isEmpty else {
+            completion?()
+            return
+        }
 
         let stopGroup = DispatchGroup()
 
@@ -1930,6 +1971,13 @@ struct MenuContentView: View {
 
         stopGroup.notify(queue: .main) {
             portStore.forceRefresh()
+            completion?()
+        }
+    }
+
+    private func archiveGroup(group: String, projects: [ProjectConfig]) {
+        stopProjects(projects, silent: true) {
+            configStore.setGroupEnabled(named: group, isEnabled: false)
         }
     }
 
@@ -2067,6 +2115,7 @@ struct MenuContentView: View {
     @ViewBuilder
     private func runStopButton(
         isRunning: Bool,
+        runDisabled: Bool = false,
         runLabel: String,
         stopLabel: String,
         runAction: @escaping () -> Void,
@@ -2075,7 +2124,7 @@ struct MenuContentView: View {
         if isRunning {
             iconActionButton(systemName: "stop.fill", helpText: stopLabel, tint: .red, action: stopAction)
         } else {
-            iconActionButton(systemName: "play.fill", helpText: runLabel, tint: .blue, action: runAction)
+            iconActionButton(systemName: "play.fill", helpText: runLabel, tint: .blue, disabled: runDisabled, action: runAction)
         }
     }
 
@@ -2099,6 +2148,9 @@ struct MenuContentView: View {
                 runAction: { runProjects(projects.filter { !isProjectRunning($0) }) },
                 stopAction: { stopProjects(projects, silent: true) }
             )
+            iconActionButton(systemName: "archivebox", helpText: "\(group) 그룹 비활성화", tint: .orange) {
+                archiveGroup(group: group, projects: projects)
+            }
             groupEditButton(group: group, projects: projects)
         }
         .padding(.horizontal, 8)
@@ -2178,10 +2230,18 @@ struct MultiDevCtrlApp: App {
     @StateObject private var portStore = PortStatusStore()
     @State private var didSetup = false
     private let addProjectController = AddProjectWindowController()
+    private let archivedProjectsController = ArchivedProjectsWindowController()
 
     var body: some Scene {
         MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
-            MenuContentView(configStore: configStore, runner: runner, gitStore: gitStore, portStore: portStore, addProjectController: addProjectController)
+            MenuContentView(
+                configStore: configStore,
+                runner: runner,
+                gitStore: gitStore,
+                portStore: portStore,
+                addProjectController: addProjectController,
+                archivedProjectsController: archivedProjectsController
+            )
                 .frame(width: 520)
                 .onAppear {
                     guard !didSetup else { return }

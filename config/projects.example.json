@@ -3,6 +3,7 @@
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "isEnabled": true,
       "actions": [
         {
           "type": "openItermSplit",
