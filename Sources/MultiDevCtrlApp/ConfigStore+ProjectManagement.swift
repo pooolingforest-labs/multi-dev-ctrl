@@ -40,6 +40,20 @@ extension ConfigStore {
         } else {
             normalized.removeValue(forKey: "group")
         }
+
+        let rawProjectType = (projectDict["projectType"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let projectType = ProjectType(rawValue: rawProjectType ?? "") ?? .client
+        normalized["projectType"] = projectType.rawValue
+
+        if projectType == .server,
+           let port = projectDict["port"] as? Int,
+           (1...65535).contains(port) {
+            normalized["port"] = port
+        } else {
+            normalized.removeValue(forKey: "port")
+        }
+
         return normalized
     }
 

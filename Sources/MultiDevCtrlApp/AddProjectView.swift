@@ -34,6 +34,30 @@ struct AddProjectView: View {
                         .disabled(state.isEditMode)
                 }
 
+                Section("프로젝트 유형") {
+                    Picker("", selection: $state.projectType) {
+                        ForEach(ProjectType.allCases) { type in
+                            Text(type.displayName).tag(type)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+
+                    if state.projectType == .client {
+                        Text("Client는 실행 시 사용 가능한 포트를 자동으로 배정합니다.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField("고정 포트", text: $state.fixedPort)
+                                .textFieldStyle(.roundedBorder)
+                            Text("Server는 프로젝트 추가 시 입력한 고정 포트만 사용합니다.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
                 Section("그룹") {
                     Toggle("새 그룹 만들기", isOn: $state.useNewGroup)
                     if state.useNewGroup {
@@ -164,7 +188,7 @@ struct AddProjectView: View {
             }
             .padding()
         }
-        .frame(minWidth: 480, maxWidth: 480, minHeight: 480)
+        .frame(minWidth: 480, maxWidth: 480, minHeight: 560)
         .coordinateSpace(name: "addProjectRoot")
         .background(
             GeometryReader { proxy in

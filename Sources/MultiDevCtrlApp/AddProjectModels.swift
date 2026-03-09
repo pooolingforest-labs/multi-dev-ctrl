@@ -37,6 +37,8 @@ enum CommandSourceType: String, CaseIterable {
 final class AddProjectState: ObservableObject {
     @Published var projectName = ""
     @Published var projectPath: URL?
+    @Published var projectType: ProjectType = .client
+    @Published var fixedPort = ""
     @Published var selectedGroup = ""
     @Published var useNewGroup = false
     @Published var newGroupName = ""
@@ -72,6 +74,8 @@ final class AddProjectState: ObservableObject {
         originalName = project.name
         projectName = project.name
         projectPath = URL(fileURLWithPath: project.expandedPath)
+        projectType = project.projectType
+        fixedPort = project.port.map(String.init) ?? ""
         isEnabled = project.isEnabled
 
         if let group = project.group?.trimmingCharacters(in: .whitespacesAndNewlines), !group.isEmpty {
@@ -108,6 +112,9 @@ final class AddProjectState: ObservableObject {
         let name = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return false }
         guard FileManager.default.fileExists(atPath: path.path) else { return false }
+        if projectType == .server, normalizedFixedPort == nil {
+            return false
+        }
 
         switch commandSourceType {
         case .stack:
@@ -126,10 +133,20 @@ final class AddProjectState: ObservableObject {
         }
     }
 
+    private var normalizedFixedPort: Int? {
+        let trimmed = fixedPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let port = Int(trimmed), (1...65535).contains(port) else {
+            return nil
+        }
+
+        return port
+    }
+
     func buildProjectConfig() -> [String: Any] {
         var dict: [String: Any] = [
             "name": projectName.trimmingCharacters(in: .whitespacesAndNewlines),
             "path": projectPath?.path ?? "",
+            "projectType": projectType.rawValue,
             "isEnabled": isEnabled
         ]
 
@@ -150,6 +167,10 @@ final class AddProjectState: ObservableObject {
             "command": command
         ]
         dict["actions"] = [action]
+
+        if projectType == .server, let fixedPort = normalizedFixedPort {
+            dict["port"] = fixedPort
+        }
 
         if commandSourceType == .script, let stopScriptFileURL {
             dict["stopCommand"] = stopScriptFileURL.path

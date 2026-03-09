@@ -29,6 +29,20 @@ enum EditorType: String, Codable, CaseIterable {
     }
 }
 
+enum ProjectType: String, Codable, CaseIterable, Identifiable {
+    case client
+    case server
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .client: return "Client"
+        case .server: return "Server"
+        }
+    }
+}
+
 struct AppConfig: Codable {
     let projects: [ProjectConfig]
     var itermMode: ItermMode?
@@ -38,6 +52,7 @@ struct AppConfig: Codable {
 struct ProjectConfig: Codable, Identifiable, Equatable {
     let name: String
     let path: String
+    let projectType: ProjectType
     let port: Int?
     let actions: [ProjectAction]
     let group: String?
@@ -50,13 +65,14 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, port, actions, group, stopCommand, isEnabled
+        case name, path, projectType, port, actions, group, stopCommand, isEnabled
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
         path = try container.decode(String.self, forKey: .path)
+        projectType = try container.decodeIfPresent(ProjectType.self, forKey: .projectType) ?? .client
         port = try container.decodeIfPresent(Int.self, forKey: .port)
         actions = try container.decode([ProjectAction].self, forKey: .actions)
         group = try container.decodeIfPresent(String.self, forKey: .group)
@@ -389,6 +405,11 @@ final class ProjectRunner: ObservableObject {
     private var runtimePortsByProject: [String: Int] = [:]
     private let fallbackPortStart = 3000
 
+    private enum PortResolution {
+        case resolved(port: Int, preferred: Int?, wasReassigned: Bool)
+        case failed(message: String)
+    }
+
     func runtimePort(for project: ProjectConfig) -> Int? {
         runtimePortsByProject[project.name]
     }
@@ -396,6 +417,10 @@ final class ProjectRunner: ObservableObject {
     func port(for project: ProjectConfig, in _: [ProjectConfig]) -> Int? {
         if let runtimePort = runtimePortsByProject[project.name] {
             return runtimePort
+        }
+
+        if project.projectType == .server {
+            return project.port
         }
 
         return preferredPortForProject(project)
@@ -411,17 +436,33 @@ final class ProjectRunner: ObservableObject {
         project.actions.contains { $0.type != .openApp } || (project.stopCommand?.contains("$PORT") ?? false)
     }
 
-    private func resolvePortForRun(_ project: ProjectConfig) -> (port: Int, preferred: Int?, wasReassigned: Bool) {
+    private func resolvePortForRun(_ project: ProjectConfig) -> PortResolution {
+        if project.projectType == .server {
+            guard let configuredPort = project.port, isValidPort(configuredPort) else {
+                runtimePortsByProject.removeValue(forKey: project.name)
+                return .failed(message: "\(project.name): server 프로젝트는 고정 포트 입력이 필요합니다")
+            }
+
+            let unavailable = unavailablePorts(excludingProjectName: project.name)
+            guard !unavailable.contains(configuredPort) else {
+                runtimePortsByProject.removeValue(forKey: project.name)
+                return .failed(message: "\(project.name): 서버 포트 \(configuredPort)가 이미 사용 중입니다")
+            }
+
+            runtimePortsByProject[project.name] = configuredPort
+            return .resolved(port: configuredPort, preferred: configuredPort, wasReassigned: false)
+        }
+
         let preferred = preferredPortForProject(project)
         let unavailable = unavailablePorts(excludingProjectName: project.name)
 
         if let preferred, !unavailable.contains(preferred) {
             runtimePortsByProject[project.name] = preferred
-            return (preferred, preferred, false)
+            return .resolved(port: preferred, preferred: preferred, wasReassigned: false)
         }
 
         if let existing = runtimePortsByProject[project.name], !unavailable.contains(existing) {
-            return (existing, preferred, false)
+            return .resolved(port: existing, preferred: preferred, wasReassigned: false)
         }
 
         let start = max(
@@ -434,7 +475,7 @@ final class ProjectRunner: ObservableObject {
             ?? (preferred ?? fallbackPortStart)
 
         runtimePortsByProject[project.name] = selected
-        return (selected, preferred, preferred != nil && preferred != selected)
+        return .resolved(port: selected, preferred: preferred, wasReassigned: preferred != nil && preferred != selected)
     }
 
     private func unavailablePorts(excludingProjectName: String? = nil) -> Set<Int> {
@@ -492,18 +533,29 @@ final class ProjectRunner: ObservableObject {
             return
         }
 
-        let resolvedPort = projectRequiresRuntimePort(project) ? resolvePortForRun(project) : nil
-        if let resolvedPort, resolvedPort.wasReassigned, let preferred = resolvedPort.preferred {
-            statusMessage = "\(project.name): \(preferred) 포트가 사용 중이라 \(resolvedPort.port)로 실행합니다"
+        let runtimePort: Int?
+        if projectRequiresRuntimePort(project) {
+            switch resolvePortForRun(project) {
+            case let .resolved(port, preferred, wasReassigned):
+                runtimePort = port
+                if wasReassigned, let preferred {
+                    statusMessage = "\(project.name): \(preferred) 포트가 사용 중이라 \(port)로 실행합니다"
+                }
+            case let .failed(message):
+                statusMessage = message
+                return
+            }
+        } else {
+            runtimePort = nil
         }
 
-        autoInstallDependenciesIfNeeded(project: project, runtimePort: resolvedPort?.port) { [weak self] installSuccess in
+        autoInstallDependenciesIfNeeded(project: project, runtimePort: runtimePort) { [weak self] installSuccess in
             guard let self else { return }
             guard installSuccess else {
                 self.runtimePortsByProject.removeValue(forKey: project.name)
                 return
             }
-            self.executeProjectActions(project, runtimePort: resolvedPort?.port, itermMode: itermMode)
+            self.executeProjectActions(project, runtimePort: runtimePort, itermMode: itermMode)
         }
     }
 
@@ -711,6 +763,14 @@ final class ProjectRunner: ObservableObject {
     }
 
     private func preferredPortForProject(_ project: ProjectConfig) -> Int? {
+        if project.projectType == .server {
+            guard let configuredPort = project.port, isValidPort(configuredPort) else {
+                return nil
+            }
+
+            return configuredPort
+        }
+
         if let configuredPort = project.port, isValidPort(configuredPort) {
             return configuredPort
         }
@@ -1981,6 +2041,12 @@ struct MenuContentView: View {
         }
     }
 
+    private func restartProject(_ project: ProjectConfig) {
+        stopProjects([project], silent: true) {
+            runProject(project)
+        }
+    }
+
     @ViewBuilder
     private func utilityButton(
         title: String,
@@ -2189,6 +2255,11 @@ struct MenuContentView: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 4) {
+                if isRunning {
+                    iconActionButton(systemName: "arrow.clockwise", helpText: "\(project.name) 재실행", tint: .orange) {
+                        restartProject(project)
+                    }
+                }
                 runStopButton(
                     isRunning: isRunning,
                     runLabel: "\(project.name) 실행",
@@ -2196,9 +2267,6 @@ struct MenuContentView: View {
                     runAction: { runProject(project) },
                     stopAction: { stopProjects([project], silent: false) }
                 )
-                iconActionButton(systemName: "pencil", helpText: "\(project.name) 수정", tint: .secondary) {
-                    addProjectController.showEditProject(project: project, configStore: configStore)
-                }
             }
         }
         .padding(.horizontal, 10)

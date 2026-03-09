@@ -3,6 +3,7 @@
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "projectType": "client",
       "isEnabled": true,
       "actions": [
         {
@@ -11,6 +12,19 @@
             "npm run dev",
             "npm run electron:dev"
           ]
+        }
+      ]
+    },
+    {
+      "name": "sample-api",
+      "path": "/Users/you/Documents/sample-api",
+      "projectType": "server",
+      "port": 8080,
+      "isEnabled": true,
+      "actions": [
+        {
+          "type": "runCommand",
+          "command": "./gradlew bootRun"
         }
       ]
     }

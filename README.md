@@ -37,11 +37,25 @@ swift run
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "projectType": "client",
       "isEnabled": true,
       "actions": [
         {
           "type": "openItermSplit",
           "commands": ["npm run dev", "npm run electron:dev"]
+        }
+      ]
+    },
+    {
+      "name": "sample-api",
+      "path": "/Users/you/Documents/sample-api",
+      "projectType": "server",
+      "port": 8080,
+      "isEnabled": true,
+      "actions": [
+        {
+          "type": "runCommand",
+          "command": "./gradlew bootRun"
         }
       ]
     }
@@ -55,6 +69,8 @@ swift run
 3. Set:
    - `name`: menu label
    - `path`: absolute project path
+   - `projectType`: `client` or `server`
+   - `port`: required for `server`, ignored for `client`
    - `isEnabled`: whether the project can be launched (`true` by default)
    - `actions`: what to run when clicked
 4. Save the file, then click `Reload Config` in the menu bar app.
@@ -66,6 +82,7 @@ Example:
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "projectType": "client",
       "isEnabled": true,
       "actions": [
         {
@@ -77,10 +94,12 @@ Example:
     {
       "name": "sample-ads",
       "path": "/Users/you/Documents/sample-ads",
+      "projectType": "server",
+      "port": 8080,
       "actions": [
         {
           "type": "openIterm",
-          "command": "npm run electron:dev"
+          "command": "./mvnw spring-boot:run"
         }
       ]
     }
@@ -94,6 +113,8 @@ Example:
 3. 아래 값을 설정합니다.
    - `name`: 메뉴바에 보일 이름
    - `path`: 프로젝트 절대 경로
+   - `projectType`: `client` 또는 `server`
+   - `port`: `server`일 때 필수, `client`일 때는 무시
    - `isEnabled`: 실행 가능 여부 (`true` 기본값)
    - `actions`: 클릭 시 실행할 동작 목록
 4. 저장 후 메뉴바 앱에서 `Reload Config`를 누릅니다.
@@ -105,6 +126,7 @@ Example:
     {
       "name": "sample-web",
       "path": "/Users/you/Documents/sample-web",
+      "projectType": "client",
       "isEnabled": true,
       "actions": [
         {
@@ -116,10 +138,12 @@ Example:
     {
       "name": "sample-ads",
       "path": "/Users/you/Documents/sample-ads",
+      "projectType": "server",
+      "port": 8080,
       "actions": [
         {
           "type": "openIterm",
-          "command": "npm run electron:dev"
+          "command": "./mvnw spring-boot:run"
         }
       ]
     }
@@ -206,9 +230,10 @@ make uninstall
 
 포트는 프로젝트 실행 시점에 결정됩니다.
 
-- 프로젝트에 명시된 포트(`projects.json`의 `port`, 명령어/스크립트/.env에서 감지된 값)를 우선 사용
-- 우선 포트가 이미 사용 중이면 사용 가능한 포트로 동적 재배정
-- 메뉴에는 실행 중 실제 사용 포트가 표시되며, 미실행 상태에서 포트를 감지하지 못한 프로젝트는 포트가 표시되지 않을 수 있음
+- `client` 프로젝트는 실행 시 사용 가능한 포트를 자동 배정합니다.
+- `server` 프로젝트는 추가/수정 시 입력한 `port`를 고정 사용합니다.
+- `server`의 고정 포트가 이미 사용 중이면 다른 포트로 재배정하지 않고 실행을 중단합니다.
+- 메뉴에는 실행 중 실제 사용 포트가 표시됩니다.
 
 ## 메뉴 구조
 
