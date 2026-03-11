@@ -1876,6 +1876,7 @@ struct MenuContentView: View {
     @ObservedObject var portStore: PortStatusStore
     var addProjectController: AddProjectWindowController
     var archivedProjectsController: ArchivedProjectsWindowController
+    var logViewerController: LogViewerWindowController
 
     private var groupedProjects: [(group: String, projects: [ProjectConfig])] {
         let projects = configStore.enabledProjects
@@ -2080,6 +2081,14 @@ struct MenuContentView: View {
         }
     }
 
+    private func restartProjects(_ projects: [ProjectConfig]) {
+        let runningOnes = projects.filter { isProjectRunning($0) }
+        guard !runningOnes.isEmpty else { return }
+        stopProjects(runningOnes, silent: true) {
+            runProjects(runningOnes)
+        }
+    }
+
     @ViewBuilder
     private func utilityButton(
         title: String,
@@ -2240,6 +2249,11 @@ struct MenuContentView: View {
                 .textCase(.uppercase)
                 .lineLimit(1)
             Spacer(minLength: 8)
+            if hasRunning {
+                iconActionButton(systemName: "arrow.clockwise", helpText: "\(group) 그룹 재실행", tint: .orange) {
+                    restartProjects(projects)
+                }
+            }
             runStopButton(
                 isRunning: showStop,
                 runLabel: "\(group) 그룹 실행",
@@ -2288,6 +2302,9 @@ struct MenuContentView: View {
             Spacer(minLength: 8)
 
             HStack(spacing: 4) {
+                iconActionButton(systemName: "doc.text.magnifyingglass", helpText: "\(project.name) 로그 보기", tint: .secondary) {
+                    logViewerController.showLog(for: project.name)
+                }
                 if isRunning {
                     iconActionButton(systemName: "arrow.clockwise", helpText: "\(project.name) 재실행", tint: .orange) {
                         restartProject(project)
@@ -2332,6 +2349,7 @@ struct MultiDevCtrlApp: App {
     @State private var didSetup = false
     private let addProjectController = AddProjectWindowController()
     private let archivedProjectsController = ArchivedProjectsWindowController()
+    private let logViewerController = LogViewerWindowController()
 
     var body: some Scene {
         MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
@@ -2341,7 +2359,8 @@ struct MultiDevCtrlApp: App {
                 gitStore: gitStore,
                 portStore: portStore,
                 addProjectController: addProjectController,
-                archivedProjectsController: archivedProjectsController
+                archivedProjectsController: archivedProjectsController,
+                logViewerController: logViewerController
             )
                 .frame(width: 520)
                 .onAppear {
