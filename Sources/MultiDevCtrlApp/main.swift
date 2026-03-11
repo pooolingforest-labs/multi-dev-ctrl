@@ -58,6 +58,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     let group: String?
     let stopCommand: String?
     let isEnabled: Bool
+    let springProfile: String?
     var id: String { name }
 
     var expandedPath: String {
@@ -65,7 +66,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case name, path, projectType, port, actions, group, stopCommand, isEnabled
+        case name, path, projectType, port, actions, group, stopCommand, isEnabled, springProfile
     }
 
     init(from decoder: Decoder) throws {
@@ -78,6 +79,7 @@ struct ProjectConfig: Codable, Identifiable, Equatable {
         group = try container.decodeIfPresent(String.self, forKey: .group)
         stopCommand = try container.decodeIfPresent(String.self, forKey: .stopCommand)
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        springProfile = try container.decodeIfPresent(String.self, forKey: .springProfile)
     }
 }
 
@@ -574,6 +576,7 @@ final class ProjectRunner: ObservableObject {
                 if let runtimePort {
                     command = commandWithRuntimePort(command, runtimePort: runtimePort)
                 }
+                command = commandWithSpringProfile(command, project: project)
 
                 do {
                     try launchBackgroundCommand(projectName: project.name, path: project.expandedPath, command: command)
@@ -587,6 +590,9 @@ final class ProjectRunner: ObservableObject {
                 if let runtimePort, let rawCommand = command {
                     command = commandWithRuntimePort(rawCommand, runtimePort: runtimePort)
                 }
+                if let rawCommand = command {
+                    command = commandWithSpringProfile(rawCommand, project: project)
+                }
                 if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle, mode: itermMode) {
                     if windowID > 0 {
                         terminalWindowIDsByProject[project.name] = windowID
@@ -598,10 +604,12 @@ final class ProjectRunner: ObservableObject {
 
             case .openItermSplit:
                 let commands = normalizedCommands(action.commands?.map {
+                    var cmd = $0
                     if let runtimePort {
-                        return commandWithRuntimePort($0, runtimePort: runtimePort)
+                        cmd = commandWithRuntimePort(cmd, runtimePort: runtimePort)
                     }
-                    return $0
+                    cmd = commandWithSpringProfile(cmd, project: project)
+                    return cmd
                 })
                 guard commands.count >= 2 else {
                     statusMessage = "\(project.name): openItermSplit requires at least 2 commands"
@@ -756,6 +764,31 @@ final class ProjectRunner: ObservableObject {
         }
 
         return rewritten
+    }
+
+    private func commandWithSpringProfile(_ command: String, project: ProjectConfig) -> String {
+        guard let profile = project.springProfile?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !profile.isEmpty else {
+            return command
+        }
+
+        // Gradle: ./gradlew bootRun → ./gradlew bootRun --args='--spring.profiles.active=dev'
+        if command.contains("bootRun") {
+            if command.contains("--args") {
+                return command
+            }
+            return "\(command) --args='--spring.profiles.active=\(profile)'"
+        }
+
+        // Maven: ./mvnw spring-boot:run → ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
+        if command.contains("spring-boot:run") {
+            if command.contains("-Dspring-boot.run.profiles") || command.contains("-Dspring.profiles.active") {
+                return command
+            }
+            return "\(command) -Dspring-boot.run.profiles=\(profile)"
+        }
+
+        return command
     }
 
     private func replacePortPlaceholder(in command: String, runtimePort: Int?) -> String {

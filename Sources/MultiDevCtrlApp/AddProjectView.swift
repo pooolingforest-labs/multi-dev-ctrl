@@ -153,6 +153,16 @@ struct AddProjectView: View {
                                     .fontWeight(.medium)
                             }
                         }
+
+                        if state.isSpringBoot {
+                            VStack(alignment: .leading, spacing: 6) {
+                                TextField("Spring Profile (예: dev, local, prod)", text: $state.springProfile)
+                                    .textFieldStyle(.roundedBorder)
+                                Text("IntelliJ의 Active profiles와 동일합니다. 비워두면 default 프로파일로 실행됩니다.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
                     } else {
                         scriptPickerRow(
                             title: "시작 스크립트",

@@ -54,6 +54,14 @@ extension ConfigStore {
             normalized.removeValue(forKey: "port")
         }
 
+        let trimmedProfile = (projectDict["springProfile"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedProfile, !trimmedProfile.isEmpty {
+            normalized["springProfile"] = trimmedProfile
+        } else {
+            normalized.removeValue(forKey: "springProfile")
+        }
+
         return normalized
     }
 

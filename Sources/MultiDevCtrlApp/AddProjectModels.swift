@@ -48,6 +48,7 @@ final class AddProjectState: ObservableObject {
     @Published var scriptFileURL: URL?
     @Published var stopScriptFileURL: URL?
     @Published var isEnabled = true
+    @Published var springProfile = ""
 
     @Published var isEditMode = false
     var originalName: String?
@@ -96,6 +97,10 @@ final class AddProjectState: ObservableObject {
         if let stopCommand = project.stopCommand {
             stopScriptFileURL = URL(fileURLWithPath: stopCommand)
         }
+
+        if let profile = project.springProfile {
+            springProfile = profile
+        }
     }
 
     var resolvedGroup: String? {
@@ -105,6 +110,10 @@ final class AddProjectState: ObservableObject {
         }
         let trimmed = selectedGroup.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var isSpringBoot: Bool {
+        commandSourceType == .stack && (selectedStack == .springBootGradle || selectedStack == .springBootMaven)
     }
 
     var isValid: Bool {
@@ -174,6 +183,11 @@ final class AddProjectState: ObservableObject {
 
         if commandSourceType == .script, let stopScriptFileURL {
             dict["stopCommand"] = stopScriptFileURL.path
+        }
+
+        let trimmedProfile = springProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isSpringBoot && !trimmedProfile.isEmpty {
+            dict["springProfile"] = trimmedProfile
         }
 
         return dict
