@@ -6,8 +6,8 @@ macOS 메뉴바에서 프로젝트별 개발 환경을 원클릭으로 실행하
 - 메뉴바에서 프로젝트 이름 클릭으로 사전 정의된 액션 일괄 실행
 - 그룹별 프로젝트 비활성화(아카이브) 및 별도 복구 UI
 - `runCommand`: 백그라운드에서 개발 서버 실행 (예: `npm run dev`)
-- `openIterm`: iTerm 탭/창 열기 (선택적으로 명령 실행)
-- `openItermSplit`: iTerm 한 탭을 2분할로 열고 명령 2개 동시 실행
+- `openGhostty` / `openGhosttySplit`: Ghostty 열기 및 스플릿 실행
+- `openIterm` / `openItermSplit`: iTerm 열기 및 스플릿 실행
 - `openApp`: 앱 실행 (예: `Visual Studio Code`)
 - 실행 중인 백그라운드 프로세스 정지
 
@@ -33,6 +33,8 @@ swift run
 ## 설정 파일 스키마
 ```json
 {
+  "terminalApp": "ghostty",
+  "terminalMode": "window",
   "projects": [
     {
       "name": "sample-web",
@@ -41,7 +43,7 @@ swift run
       "isEnabled": true,
       "actions": [
         {
-          "type": "openItermSplit",
+          "type": "openGhosttySplit",
           "commands": ["npm run dev", "npm run electron:dev"]
         }
       ]
@@ -78,6 +80,8 @@ swift run
 Example:
 ```json
 {
+  "terminalApp": "ghostty",
+  "terminalMode": "window",
   "projects": [
     {
       "name": "sample-web",
@@ -86,7 +90,7 @@ Example:
       "isEnabled": true,
       "actions": [
         {
-          "type": "openItermSplit",
+          "type": "openGhosttySplit",
           "commands": ["npm run dev", "npm run electron:dev"]
         }
       ]
@@ -98,7 +102,7 @@ Example:
       "port": 8080,
       "actions": [
         {
-          "type": "openIterm",
+          "type": "openGhostty",
           "command": "./mvnw spring-boot:run"
         }
       ]
@@ -122,6 +126,8 @@ Example:
 예시:
 ```json
 {
+  "terminalApp": "ghostty",
+  "terminalMode": "window",
   "projects": [
     {
       "name": "sample-web",
@@ -130,7 +136,7 @@ Example:
       "isEnabled": true,
       "actions": [
         {
-          "type": "openItermSplit",
+          "type": "openGhosttySplit",
           "commands": ["npm run dev", "npm run electron:dev"]
         }
       ]
@@ -142,7 +148,7 @@ Example:
       "port": 8080,
       "actions": [
         {
-          "type": "openIterm",
+          "type": "openGhostty",
           "command": "./mvnw spring-boot:run"
         }
       ]
@@ -155,9 +161,16 @@ Example:
 - `runCommand`
   - 필수: `command`
   - 지정 경로에서 `zsh -lc`로 실행됩니다.
+- `openGhostty`
+  - 선택: `command`
+  - `command`가 있으면 Ghostty 새 탭/창에서 실행
+  - `command`가 없으면 해당 경로로 Ghostty 열기
+- `openGhosttySplit`
+  - 필수: `commands` (최소 2개)
+  - Ghostty 한 탭에서 세로 스플릿으로 명령 2개를 동시에 실행
 - `openIterm`
   - 선택: `command`
-  - `command`가 있으면 iTerm 새 탭에서 `cd <path>; <command>` 실행
+  - `command`가 있으면 iTerm 새 탭/창에서 실행
   - `command`가 없으면 해당 경로로 iTerm 열기
 - `openItermSplit`
   - 필수: `commands` (최소 2개)
@@ -210,18 +223,32 @@ make uninstall
 }
 ```
 
-## iTerm 모드 설정
+## 터미널 앱 설정
 
-메뉴 하단의 **iTerm 모드** 서브메뉴에서 전환하거나, `projects.json`에서 직접 설정할 수 있습니다.
-
-| 모드 | 설명 |
-|------|------|
-| `window` | 프로젝트마다 새 iTerm 윈도우 (기본값) |
-| `tab` | 하나의 iTerm 윈도우에 탭으로 열기 |
+메뉴 하단의 **터미널 앱** 서브메뉴에서 전환하거나, `projects.json`에서 직접 설정할 수 있습니다.
 
 ```json
 {
-  "itermMode": "tab",
+  "terminalApp": "ghostty",
+  "projects": [...]
+}
+```
+
+- `terminalApp`은 앱 내부 공용 터미널 동작에 사용됩니다.
+- 프로젝트 실행 액션은 `openGhostty*` 또는 `openIterm*`로 앱별 지정이 가능합니다.
+
+## 터미널 모드 설정
+
+메뉴 하단의 **터미널 모드** 서브메뉴에서 전환하거나, `projects.json`에서 직접 설정할 수 있습니다.
+
+| 모드 | 설명 |
+|------|------|
+| `window` | 프로젝트마다 새 터미널 윈도우 (기본값) |
+| `tab` | 하나의 터미널 윈도우에 탭으로 열기 |
+
+```json
+{
+  "terminalMode": "tab",
   "projects": [...]
 }
 ```
@@ -248,7 +275,8 @@ make uninstall
 ──────────────
 설정 새로고침
 설정 폴더 열기
-iTerm 모드: 탭/윈도우  ▸
+터미널 앱: Ghostty/iTerm  ▸
+터미널 모드: 탭/윈도우  ▸
 ──────────────
 종료
 ```
@@ -261,7 +289,7 @@ iTerm 모드: 탭/윈도우  ▸
 | (없음) | Git 최신 상태 |
 
 ## 참고
-- iTerm 제어는 macOS 자동화 권한 허용이 필요할 수 있습니다.
+- Ghostty 또는 iTerm 제어는 macOS 자동화 권한 허용이 필요할 수 있습니다.
 - 설정 파일 탐색 순서:
   1. `~/.multi-dev-ctrl/projects.json`
   2. `<현재 실행 경로>/config/projects.json`

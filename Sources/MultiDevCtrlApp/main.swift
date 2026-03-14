@@ -2,9 +2,21 @@ import AppKit
 import Foundation
 import SwiftUI
 
-enum ItermMode: String, Codable {
+enum TerminalMode: String, Codable {
     case window
     case tab
+}
+
+enum TerminalApp: String, Codable, CaseIterable {
+    case ghostty
+    case iterm
+
+    var displayName: String {
+        switch self {
+        case .ghostty: return "Ghostty"
+        case .iterm: return "iTerm"
+        }
+    }
 }
 
 enum EditorType: String, Codable, CaseIterable {
@@ -45,8 +57,34 @@ enum ProjectType: String, Codable, CaseIterable, Identifiable {
 
 struct AppConfig: Codable {
     let projects: [ProjectConfig]
-    var itermMode: ItermMode?
+    var terminalMode: TerminalMode?
+    var terminalApp: TerminalApp?
     var editor: EditorType?
+
+    enum CodingKeys: String, CodingKey {
+        case projects
+        case terminalMode
+        case terminalApp
+        case itermMode
+        case editor
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projects = try container.decode([ProjectConfig].self, forKey: .projects)
+        terminalMode = try container.decodeIfPresent(TerminalMode.self, forKey: .terminalMode)
+            ?? container.decodeIfPresent(TerminalMode.self, forKey: .itermMode)
+        terminalApp = try container.decodeIfPresent(TerminalApp.self, forKey: .terminalApp)
+        editor = try container.decodeIfPresent(EditorType.self, forKey: .editor)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(projects, forKey: .projects)
+        try container.encodeIfPresent(terminalMode, forKey: .terminalMode)
+        try container.encodeIfPresent(terminalApp, forKey: .terminalApp)
+        try container.encodeIfPresent(editor, forKey: .editor)
+    }
 }
 
 struct ProjectConfig: Codable, Identifiable, Equatable {
@@ -92,9 +130,56 @@ struct ProjectAction: Codable, Equatable {
 
 enum ActionType: String, Codable {
     case runCommand
+    case openGhostty
+    case openGhosttySplit
     case openIterm
     case openItermSplit
     case openApp
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+
+        switch rawValue {
+        case "runCommand":
+            self = .runCommand
+        case "openGhostty":
+            self = .openGhostty
+        case "openGhosttySplit":
+            self = .openGhosttySplit
+        case "openIterm":
+            self = .openIterm
+        case "openItermSplit":
+            self = .openItermSplit
+        case "openApp":
+            self = .openApp
+        default:
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unknown action type: \(rawValue)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    var terminalApp: TerminalApp? {
+        switch self {
+        case .openGhostty, .openGhosttySplit:
+            return .ghostty
+        case .openIterm, .openItermSplit:
+            return .iterm
+        case .runCommand, .openApp:
+            return nil
+        }
+    }
+
+    var isTerminalAction: Bool {
+        terminalApp != nil
+    }
 }
 
 enum GitCommitState {
@@ -124,7 +209,8 @@ enum GitCommitState {
 final class ConfigStore: ObservableObject {
     @Published private(set) var projects: [ProjectConfig] = []
     @Published var statusMessage: String?
-    @Published var itermMode: ItermMode = .window
+    @Published var terminalMode: TerminalMode = .window
+    @Published var terminalApp: TerminalApp = .ghostty
     @Published var editor: EditorType = .cursor
 
     let fileManager = FileManager.default
@@ -145,7 +231,8 @@ final class ConfigStore: ObservableObject {
             let data = try Data(contentsOf: configURL)
             let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
             projects = decoded.projects
-            itermMode = decoded.itermMode ?? .window
+            terminalMode = decoded.terminalMode ?? .window
+            terminalApp = decoded.terminalApp ?? Self.inferredTerminalApp(from: decoded.projects)
             editor = decoded.editor ?? .cursor
             statusMessage = "Loaded \(decoded.projects.count) projects from \(configURL.path)"
         } catch {
@@ -154,16 +241,32 @@ final class ConfigStore: ObservableObject {
         }
     }
 
-    func setItermMode(_ mode: ItermMode) {
+    func setTerminalMode(_ mode: TerminalMode) {
         guard let configURL = currentConfigURL else { return }
         do {
             let data = try Data(contentsOf: configURL)
             var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            json["itermMode"] = mode.rawValue
+            json["terminalMode"] = mode.rawValue
+            json.removeValue(forKey: "itermMode")
             let output = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
             try output.write(to: configURL)
-            itermMode = mode
-            statusMessage = "iTerm 모드: \(mode == .tab ? "탭" : "윈도우")"
+            terminalMode = mode
+            statusMessage = "터미널 모드: \(mode == .tab ? "탭" : "윈도우")"
+        } catch {
+            statusMessage = "설정 저장 실패: \(error.localizedDescription)"
+        }
+    }
+
+    func setTerminalApp(_ app: TerminalApp) {
+        guard let configURL = currentConfigURL else { return }
+        do {
+            let data = try Data(contentsOf: configURL)
+            var json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            json["terminalApp"] = app.rawValue
+            let output = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try output.write(to: configURL)
+            terminalApp = app
+            statusMessage = "터미널 앱: \(app.displayName)"
         } catch {
             statusMessage = "설정 저장 실패: \(error.localizedDescription)"
         }
@@ -208,6 +311,17 @@ final class ConfigStore: ObservableObject {
                 NSLocalizedDescriptionKey: "No config file found. Create ~/.multi-dev-ctrl/projects.json"
             ]
         )
+    }
+
+    private static func inferredTerminalApp(from projects: [ProjectConfig]) -> TerminalApp {
+        for project in projects {
+            for action in project.actions {
+                if let app = action.type.terminalApp {
+                    return app
+                }
+            }
+        }
+        return .ghostty
     }
 }
 
@@ -367,6 +481,11 @@ private struct ClaudeTargetProject {
     let isNextJS: Bool
 }
 
+private struct TerminalWindowRef {
+    let app: TerminalApp
+    let id: String
+}
+
 private enum StopCommandResult {
     case notConfigured
     case succeeded
@@ -402,7 +521,7 @@ final class ProjectRunner: ObservableObject {
 
     private let fileManager = FileManager.default
     private var processesByProject: [String: [ManagedProcess]] = [:]
-    private var terminalWindowIDsByProject: [String: Int] = [:]
+    private var terminalWindowsByProject: [String: TerminalWindowRef] = [:]
     private var dependencyInstallInProgressProjects: Set<String> = []
     private var runtimePortsByProject: [String: Int] = [:]
     private let fallbackPortStart = 3000
@@ -510,7 +629,7 @@ final class ProjectRunner: ObservableObject {
         return nil
     }
 
-    func run(_ project: ProjectConfig, allProjects _: [ProjectConfig], itermMode: ItermMode = .window) {
+    func run(_ project: ProjectConfig, allProjects _: [ProjectConfig], terminalMode: TerminalMode = .window) {
         guard project.isEnabled else {
             statusMessage = "\(project.name): 비활성 프로젝트라 실행하지 않습니다"
             return
@@ -557,14 +676,12 @@ final class ProjectRunner: ObservableObject {
                 self.runtimePortsByProject.removeValue(forKey: project.name)
                 return
             }
-            self.executeProjectActions(project, runtimePort: runtimePort, itermMode: itermMode)
+            self.executeProjectActions(project, runtimePort: runtimePort, terminalMode: terminalMode)
         }
     }
 
-    private func executeProjectActions(_ project: ProjectConfig, runtimePort: Int?, itermMode: ItermMode) {
+    private func executeProjectActions(_ project: ProjectConfig, runtimePort: Int?, terminalMode: TerminalMode) {
         var startedBackgroundProcess = false
-        let projectMarker = markerForProject(project.name)
-        let projectTitle = project.name
 
         for action in project.actions {
             switch action.type {
@@ -585,6 +702,42 @@ final class ProjectRunner: ObservableObject {
                     statusMessage = "\(project.name): command failed to start (\(error.localizedDescription))"
                 }
 
+            case .openGhostty:
+                var command = action.command
+                if let runtimePort, let rawCommand = command {
+                    command = commandWithRuntimePort(rawCommand, runtimePort: runtimePort)
+                }
+                if let rawCommand = command {
+                    command = commandWithSpringProfile(rawCommand, project: project)
+                }
+                if let windowID = openInGhostty(path: project.expandedPath, command: command, mode: terminalMode) {
+                    terminalWindowsByProject[project.name] = TerminalWindowRef(app: .ghostty, id: windowID)
+                    statusMessage = "\(project.name): opened Ghostty"
+                } else {
+                    statusMessage = "\(project.name): failed to open Ghostty"
+                }
+
+            case .openGhosttySplit:
+                let commands = normalizedCommands(action.commands?.map {
+                    var cmd = $0
+                    if let runtimePort {
+                        cmd = commandWithRuntimePort(cmd, runtimePort: runtimePort)
+                    }
+                    cmd = commandWithSpringProfile(cmd, project: project)
+                    return cmd
+                })
+                guard commands.count >= 2 else {
+                    statusMessage = "\(project.name): openGhosttySplit requires at least 2 commands"
+                    continue
+                }
+
+                if let windowID = openInGhosttySplit(path: project.expandedPath, commands: commands) {
+                    terminalWindowsByProject[project.name] = TerminalWindowRef(app: .ghostty, id: windowID)
+                    statusMessage = "\(project.name): opened Ghostty split"
+                } else {
+                    statusMessage = "\(project.name): failed to open Ghostty split"
+                }
+
             case .openIterm:
                 var command = action.command
                 if let runtimePort, let rawCommand = command {
@@ -593,10 +746,14 @@ final class ProjectRunner: ObservableObject {
                 if let rawCommand = command {
                     command = commandWithSpringProfile(rawCommand, project: project)
                 }
-                if let windowID = openInIterm(path: project.expandedPath, command: command, marker: projectMarker, title: projectTitle, mode: itermMode) {
-                    if windowID > 0 {
-                        terminalWindowIDsByProject[project.name] = windowID
-                    }
+                if let windowID = openInIterm(
+                    path: project.expandedPath,
+                    command: command,
+                    marker: markerForProject(project.name),
+                    title: project.name,
+                    mode: terminalMode
+                ) {
+                    terminalWindowsByProject[project.name] = TerminalWindowRef(app: .iterm, id: windowID)
                     statusMessage = "\(project.name): opened iTerm"
                 } else {
                     statusMessage = "\(project.name): failed to open iTerm"
@@ -616,10 +773,13 @@ final class ProjectRunner: ObservableObject {
                     continue
                 }
 
-                if let windowID = openInItermSplit(path: project.expandedPath, commands: commands, marker: projectMarker, title: projectTitle) {
-                    if windowID > 0 {
-                        terminalWindowIDsByProject[project.name] = windowID
-                    }
+                if let windowID = openInItermSplit(
+                    path: project.expandedPath,
+                    commands: commands,
+                    marker: markerForProject(project.name),
+                    title: project.name
+                ) {
+                    terminalWindowsByProject[project.name] = TerminalWindowRef(app: .iterm, id: windowID)
                     statusMessage = "\(project.name): opened iTerm split"
                 } else {
                     statusMessage = "\(project.name): failed to open iTerm split"
@@ -704,14 +864,14 @@ final class ProjectRunner: ObservableObject {
                    !command.isEmpty {
                     commands.append(command)
                 }
-            case .openIterm:
+            case .openGhostty, .openIterm:
                 if let command = action.command?
                     .replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT")
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                    !command.isEmpty {
                     commands.append(command)
                 }
-            case .openItermSplit:
+            case .openGhosttySplit, .openItermSplit:
                 let splitCommands = normalizedCommands(
                     action.commands?.map { $0.replacingOccurrences(of: "$PORT", with: runtimePort.map(String.init) ?? "$PORT") }
                 )
@@ -838,12 +998,12 @@ final class ProjectRunner: ObservableObject {
 
         for action in actions {
             switch action.type {
-            case .runCommand, .openIterm:
+            case .runCommand, .openGhostty, .openIterm:
                 if let command = action.command?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !command.isEmpty {
                     commands.append(command)
                 }
-            case .openItermSplit:
+            case .openGhosttySplit, .openItermSplit:
                 commands.append(
                     contentsOf: normalizedCommands(action.commands?.map {
                         $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1138,7 +1298,7 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    func runBulkCommitAndPushWithClaude(projects: [ProjectConfig]) {
+    func runBulkCommitAndPushWithClaude(projects: [ProjectConfig], terminalApp: TerminalApp, terminalMode: TerminalMode) {
         if isBulkCommitRunning {
             statusMessage = "Bulk commit/push is already running"
             return
@@ -1164,14 +1324,14 @@ final class ProjectRunner: ObservableObject {
             projects: snapshots,
             prompt: Self.buildClaudeBulkCommitPrompt(projects: snapshots),
             runFilePrefix: "bulk-commit-push-claude",
-            marker: "mdc-bulk-commit-push",
-            title: "Bulk Commit/Push",
-            successMessage: "Opened iTerm and started Claude bulk commit/push",
-            failureMessage: "Failed to open iTerm for Claude bulk commit/push"
+            terminalApp: terminalApp,
+            terminalMode: terminalMode,
+            successMessage: "Opened \(terminalApp.displayName) and started Claude bulk commit/push",
+            failureMessage: "Failed to open \(terminalApp.displayName) for Claude bulk commit/push"
         )
     }
 
-    func runProjectCommitAndPushWithClaude(project: ProjectConfig) {
+    func runProjectCommitAndPushWithClaude(project: ProjectConfig, terminalApp: TerminalApp, terminalMode: TerminalMode) {
         if commitPushProjectsLaunching.contains(project.name) {
             statusMessage = "\(project.name): commit/push launch is already in progress"
             return
@@ -1190,10 +1350,10 @@ final class ProjectRunner: ObservableObject {
             projects: [snapshot],
             prompt: Self.buildClaudeSingleCommitPrompt(project: snapshot),
             runFilePrefix: "single-commit-push-claude-\(sanitize(project.name))",
-            marker: "mdc-single-commit-push-\(sanitize(project.name))",
-            title: "Commit/Push - \(project.name)",
-            successMessage: "\(project.name): opened iTerm and started Claude commit/push",
-            failureMessage: "\(project.name): failed to open iTerm for Claude commit/push"
+            terminalApp: terminalApp,
+            terminalMode: terminalMode,
+            successMessage: "\(project.name): opened \(terminalApp.displayName) and started Claude commit/push",
+            failureMessage: "\(project.name): failed to open \(terminalApp.displayName) for Claude commit/push"
         )
     }
 
@@ -1206,7 +1366,7 @@ final class ProjectRunner: ObservableObject {
     }
 
     private func hasTerminalAction(project: ProjectConfig) -> Bool {
-        project.actions.contains(where: { $0.type == .openIterm || $0.type == .openItermSplit })
+        project.actions.contains(where: { $0.type.isTerminalAction })
     }
 
     nonisolated private static func findClaudeExecutable() -> String? {
@@ -1340,8 +1500,8 @@ final class ProjectRunner: ObservableObject {
         projects: [ClaudeTargetProject],
         prompt: String,
         runFilePrefix: String,
-        marker: String,
-        title: String,
+        terminalApp: TerminalApp,
+        terminalMode: TerminalMode,
         successMessage: String,
         failureMessage: String
     ) {
@@ -1368,18 +1528,18 @@ final class ProjectRunner: ObservableObject {
             return
         }
 
-        let command = buildClaudeItermCommand(
+        let command = buildClaudeTerminalCommand(
             claudePath: claudePath,
             projects: projects,
             promptFilePath: promptURL.path,
             streamLogPath: streamLogURL.path
         )
 
-        if openInIterm(
+        if openClaudeTerminal(
+            terminalApp: terminalApp,
             path: fileManager.homeDirectoryForCurrentUser.path,
             command: command,
-            marker: marker,
-            title: title
+            terminalMode: terminalMode
         ) != nil {
             statusMessage = successMessage
         } else {
@@ -1387,7 +1547,7 @@ final class ProjectRunner: ObservableObject {
         }
     }
 
-    private func buildClaudeItermCommand(
+    private func buildClaudeTerminalCommand(
         claudePath: String,
         projects: [ClaudeTargetProject],
         promptFilePath: String,
@@ -1413,18 +1573,58 @@ final class ProjectRunner: ObservableObject {
         """
     }
 
+    private func openClaudeTerminal(
+        terminalApp: TerminalApp,
+        path: String,
+        command: String,
+        terminalMode: TerminalMode
+    ) -> String? {
+        switch terminalApp {
+        case .ghostty:
+            return openInGhostty(path: path, command: command, mode: terminalMode)
+        case .iterm:
+            return openInIterm(
+                path: path,
+                command: command,
+                marker: "mdc-claude-\(Int(Date().timeIntervalSince1970))",
+                title: "Claude Commit/Push",
+                mode: terminalMode
+            )
+        }
+    }
+
     private func markerForProject(_ projectName: String) -> String {
         projectName
     }
 
     private func focusExistingWindow(for project: ProjectConfig) -> Bool {
         if hasTerminalAction(project: project) {
-            if let windowID = terminalWindowIDsByProject[project.name], focusItermWindow(windowID: windowID) {
-                return true
+            if let windowRef = terminalWindowsByProject[project.name] {
+                switch windowRef.app {
+                case .ghostty:
+                    if focusGhosttyWindow(windowID: windowRef.id) {
+                        return true
+                    }
+                case .iterm:
+                    if focusItermWindow(windowID: windowRef.id) {
+                        return true
+                    }
+                }
             }
 
-            if focusItermSession(marker: markerForProject(project.name)) {
-                return true
+            for action in project.actions {
+                switch action.type.terminalApp {
+                case .ghostty:
+                    if focusGhosttyWorkspace(path: project.expandedPath) {
+                        return true
+                    }
+                case .iterm:
+                    if focusItermSession(marker: markerForProject(project.name)) {
+                        return true
+                    }
+                case nil:
+                    continue
+                }
             }
         }
 
@@ -1639,12 +1839,16 @@ final class ProjectRunner: ObservableObject {
         return result.booleanValue
     }
 
-    private func focusItermWindow(windowID: Int) -> Bool {
+    private func focusItermWindow(windowID: String) -> Bool {
+        guard let numericWindowID = Int(windowID) else {
+            return false
+        }
+
         let script = """
         tell application "iTerm"
             activate
             try
-                set targetWindow to (first window whose id is \(windowID))
+                set targetWindow to (first window whose id is \(numericWindowID))
                 set current window to targetWindow
                 return true
             on error
@@ -1670,7 +1874,81 @@ final class ProjectRunner: ObservableObject {
         return result.booleanValue
     }
 
-    private func openInIterm(path: String, command: String?, marker: String, title: String, mode: ItermMode = .window) -> Int? {
+    private func focusGhosttyWorkspace(path: String) -> Bool {
+        let escapedPath = escapeForAppleScript(path)
+        let script = """
+        tell application "Ghostty"
+            activate
+            repeat with t in terminals
+                if (working directory of t as text) is "\(escapedPath)" then
+                    focus t
+                    return true
+                end if
+            end repeat
+            return false
+        end tell
+        """
+
+        guard let appleScript = NSAppleScript(source: script) else {
+            return false
+        }
+
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return false
+        }
+
+        if let stringValue = result.stringValue {
+            return stringValue.lowercased() == "true"
+        }
+
+        return result.booleanValue
+    }
+
+    private func focusGhosttyWindow(windowID: String) -> Bool {
+        let escapedWindowID = escapeForAppleScript(windowID)
+        let script = """
+        tell application "Ghostty"
+            activate
+            try
+                repeat with w in windows
+                    if (id of w as text) is "\(escapedWindowID)" then
+                        activate window w
+                        return true
+                    end if
+                end repeat
+                return false
+            on error
+                return false
+            end try
+        end tell
+        """
+
+        guard let appleScript = NSAppleScript(source: script) else {
+            return false
+        }
+
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return false
+        }
+
+        if let stringValue = result.stringValue {
+            return stringValue.lowercased() == "true"
+        }
+
+        return result.booleanValue
+    }
+
+    private func openInIterm(
+        path: String,
+        command: String?,
+        marker: String,
+        title: String,
+        mode: TerminalMode = .window
+    ) -> String? {
         let joinedCommand = buildItermCommand(path: path, command: command, title: title)
 
         let appleScriptCommand = escapeForAppleScript(joinedCommand)
@@ -1717,27 +1995,28 @@ final class ProjectRunner: ObservableObject {
         if let appleScript = NSAppleScript(source: script) {
             var error: NSDictionary?
             let result = appleScript.executeAndReturnError(&error)
-            if error == nil {
-                if let parsed = parseIntValue(result) {
-                    return parsed
-                }
+            if error == nil, let parsed = parseStringValue(result) {
+                return parsed
             }
         }
 
         guard let command, !command.isEmpty else {
+            if openApplicationWithPath(appName: "iTerm", path: path) {
+                return "iterm-app"
+            }
             if openApplicationWithPath(appName: "Terminal", path: path) {
-                return -1
+                return "terminal-app"
             }
             return nil
         }
 
         if runTerminalFallback(path: path, command: command) {
-            return -1
+            return "terminal-fallback"
         }
         return nil
     }
 
-    private func openInItermSplit(path: String, commands: [String], marker: String, title: String) -> Int? {
+    private func openInItermSplit(path: String, commands: [String], marker: String, title: String) -> String? {
         let commandA = escapeForAppleScript(buildItermCommand(path: path, command: commands[0], title: title))
         let commandB = escapeForAppleScript(buildItermCommand(path: path, command: commands[1], title: title))
         let escapedMarker = escapeForAppleScript(marker)
@@ -1769,7 +2048,98 @@ final class ProjectRunner: ObservableObject {
             return nil
         }
 
-        return parseIntValue(result)
+        return parseStringValue(result)
+    }
+
+    private func openInGhostty(path: String, command: String?, mode: TerminalMode = .window) -> String? {
+        let escapedPath = escapeForAppleScript(path)
+        let inputCommand = buildGhosttyInitialInput(command)
+        let inputLine: String
+        if let inputCommand {
+            inputLine = "set initial input of surfaceConfig to \"\(escapeForAppleScript(inputCommand))\""
+        } else {
+            inputLine = ""
+        }
+
+        let script: String
+        if mode == .tab {
+            script = """
+            tell application "Ghostty"
+                activate
+                set surfaceConfig to new surface configuration
+                set initial working directory of surfaceConfig to "\(escapedPath)"
+                \(inputLine)
+                if (count of windows) = 0 then
+                    set newWindow to new window with configuration surfaceConfig
+                    return id of newWindow
+                else
+                    set targetWindow to front window
+                    set newTab to new tab in targetWindow with configuration surfaceConfig
+                    select tab newTab
+                    return id of targetWindow
+                end if
+            end tell
+            """
+        } else {
+            script = """
+            tell application "Ghostty"
+                activate
+                set surfaceConfig to new surface configuration
+                set initial working directory of surfaceConfig to "\(escapedPath)"
+                \(inputLine)
+                set newWindow to new window with configuration surfaceConfig
+                return id of newWindow
+            end tell
+            """
+        }
+
+        if let appleScript = NSAppleScript(source: script) {
+            var error: NSDictionary?
+            let result = appleScript.executeAndReturnError(&error)
+            if error == nil, let parsed = parseStringValue(result) {
+                return parsed
+            }
+        }
+
+        guard let command, !command.isEmpty else {
+            return openApplication(named: "Ghostty") ? "ghostty-app" : nil
+        }
+
+        return runGhosttyCommandLineFallback(path: path, command: command) ? "ghostty-cli" : nil
+    }
+
+    private func openInGhosttySplit(path: String, commands: [String]) -> String? {
+        let escapedPath = escapeForAppleScript(path)
+        let commandA = escapeForAppleScript(buildGhosttyInitialInput(commands[0]) ?? "")
+        let commandB = escapeForAppleScript(buildGhosttyInitialInput(commands[1]) ?? "")
+
+        let script = """
+        tell application "Ghostty"
+            activate
+            set surfaceConfigA to new surface configuration
+            set initial working directory of surfaceConfigA to "\(escapedPath)"
+            set initial input of surfaceConfigA to "\(commandA)"
+            set surfaceConfigB to new surface configuration
+            set initial working directory of surfaceConfigB to "\(escapedPath)"
+            set initial input of surfaceConfigB to "\(commandB)"
+            set newWindow to new window with configuration surfaceConfigA
+            set baseTerminal to focused terminal of selected tab of newWindow
+            split baseTerminal direction right with configuration surfaceConfigB
+            return id of newWindow
+        end tell
+        """
+
+        guard let appleScript = NSAppleScript(source: script) else {
+            return nil
+        }
+
+        var error: NSDictionary?
+        let result = appleScript.executeAndReturnError(&error)
+        guard error == nil else {
+            return nil
+        }
+
+        return parseStringValue(result)
     }
 
     private func buildItermCommand(path: String, command: String?, title: String) -> String {
@@ -1789,19 +2159,47 @@ final class ProjectRunner: ObservableObject {
         return parts.joined(separator: "; ")
     }
 
-    private func parseIntValue(_ descriptor: NSAppleEventDescriptor) -> Int? {
-        if let stringValue = descriptor.stringValue, let parsed = Int(stringValue) {
-            return parsed
+    private func buildGhosttyInitialInput(_ command: String?) -> String? {
+        guard let command = command?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !command.isEmpty else {
+            return nil
         }
 
-        let parsed = Int(descriptor.int32Value)
-        return parsed == 0 ? nil : parsed
+        return "\(command)\n"
+    }
+
+    private func parseStringValue(_ descriptor: NSAppleEventDescriptor) -> String? {
+        if let stringValue = descriptor.stringValue, !stringValue.isEmpty {
+            return stringValue
+        }
+
+        let parsed = descriptor.int32Value
+        return parsed == 0 ? nil : String(parsed)
     }
 
     private func openApplicationWithPath(appName: String, path: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-a", appName, path]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func runGhosttyCommandLineFallback(path: String, command: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [
+            "-na", "Ghostty.app",
+            "--args",
+            "--working-directory=\(path)",
+            "-e", "/bin/zsh", "-lc", command
+        ]
 
         do {
             try process.run()
@@ -1951,7 +2349,11 @@ struct MenuContentView: View {
                 systemName: "arrow.up.circle",
                 disabled: enabledProjects.isEmpty || runner.isBulkCommitRunning
             ) {
-                runner.runBulkCommitAndPushWithClaude(projects: enabledProjects)
+                runner.runBulkCommitAndPushWithClaude(
+                    projects: enabledProjects,
+                    terminalApp: configStore.terminalApp,
+                    terminalMode: configStore.terminalMode
+                )
             }
 
             utilityButton(title: "프로젝트 추가", systemName: "plus") {
@@ -1985,12 +2387,20 @@ struct MenuContentView: View {
                 }
             }
 
-            utilityMenu(title: "iTerm 모드: \(configStore.itermMode == .tab ? "탭" : "윈도우")", systemName: "rectangle.split.2x1") {
-                Button("\(configStore.itermMode == .tab ? "✓ " : "   ")탭 모드") {
-                    configStore.setItermMode(.tab)
+            utilityMenu(title: "터미널 앱: \(configStore.terminalApp.displayName)", systemName: "terminal") {
+                ForEach(TerminalApp.allCases, id: \.self) { app in
+                    Button("\(configStore.terminalApp == app ? "✓ " : "   ")\(app.displayName)") {
+                        configStore.setTerminalApp(app)
+                    }
                 }
-                Button("\(configStore.itermMode == .window ? "✓ " : "   ")윈도우 모드") {
-                    configStore.setItermMode(.window)
+            }
+
+            utilityMenu(title: "터미널 모드: \(configStore.terminalMode == .tab ? "탭" : "윈도우")", systemName: "rectangle.split.2x1") {
+                Button("\(configStore.terminalMode == .tab ? "✓ " : "   ")탭 모드") {
+                    configStore.setTerminalMode(.tab)
+                }
+                Button("\(configStore.terminalMode == .window ? "✓ " : "   ")윈도우 모드") {
+                    configStore.setTerminalMode(.window)
                 }
             }
 
@@ -2029,12 +2439,12 @@ struct MenuContentView: View {
 
     private func runProject(_ project: ProjectConfig) {
         guard project.isEnabled || isProjectRunning(project) else {
-            runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+            runner.run(project, allProjects: configStore.projects, terminalMode: configStore.terminalMode)
             return
         }
 
         guard !isProjectRunning(project) else { return }
-        runner.run(project, allProjects: configStore.projects, itermMode: configStore.itermMode)
+        runner.run(project, allProjects: configStore.projects, terminalMode: configStore.terminalMode)
     }
 
     private func runProjects(_ projects: [ProjectConfig]) {
@@ -2347,12 +2757,18 @@ struct MultiDevCtrlApp: App {
     @StateObject private var gitStore = GitStatusStore()
     @StateObject private var portStore = PortStatusStore()
     @State private var didSetup = false
+    @State private var isMenuBarInserted = true
     private let addProjectController = AddProjectWindowController()
     private let archivedProjectsController = ArchivedProjectsWindowController()
     private let logViewerController = LogViewerWindowController()
 
+    init() {
+        // Keep the app as a menu bar accessory when launched outside Finder.
+        NSApplication.shared.setActivationPolicy(.accessory)
+    }
+
     var body: some Scene {
-        MenuBarExtra("Dev Ctrl", systemImage: "terminal") {
+        MenuBarExtra(isInserted: $isMenuBarInserted) {
             MenuContentView(
                 configStore: configStore,
                 runner: runner,
@@ -2373,6 +2789,8 @@ struct MultiDevCtrlApp: App {
                 .onChange(of: configStore.projects) { _, projects in
                     gitStore.refresh(projects: projects)
                 }
+        } label: {
+            Image(systemName: "terminal")
         }
         .menuBarExtraStyle(.window)
     }

@@ -24,7 +24,7 @@ install: build
 	@/usr/libexec/PlistBuddy -c "Delete :LSUIElement" "$(CONTENTS)/Info.plist" 2>/dev/null; true
 	@/usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$(CONTENTS)/Info.plist"
 	@/usr/libexec/PlistBuddy -c "Delete :NSAppleEventsUsageDescription" "$(CONTENTS)/Info.plist" 2>/dev/null; true
-	@/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string 'MultiDevCtrl needs to control iTerm for terminal management.'" "$(CONTENTS)/Info.plist"
+	@/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string 'MultiDevCtrl needs to control Ghostty or iTerm for terminal management.'" "$(CONTENTS)/Info.plist"
 	@echo "Installed to $(APP_DIR)"
 	@pkill -f "$(APP_NAME)" 2>/dev/null || true
 	@sleep 0.5

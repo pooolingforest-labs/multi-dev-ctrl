@@ -1,4 +1,6 @@
 {
+  "terminalApp": "ghostty",
+  "terminalMode": "window",
   "projects": [
     {
       "name": "sample-web",
@@ -7,7 +9,7 @@
       "isEnabled": true,
       "actions": [
         {
-          "type": "openItermSplit",
+          "type": "openGhosttySplit",
           "commands": [
             "npm run dev",
             "npm run electron:dev"
