@@ -46,8 +46,7 @@ extension ConfigStore {
         let projectType = ProjectType(rawValue: rawProjectType ?? "") ?? .client
         normalized["projectType"] = projectType.rawValue
 
-        if projectType == .server,
-           let port = projectDict["port"] as? Int,
+        if let port = projectDict["port"] as? Int,
            (1...65535).contains(port) {
             normalized["port"] = port
         } else {

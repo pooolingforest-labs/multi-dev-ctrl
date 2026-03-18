@@ -177,7 +177,7 @@ final class AddProjectState: ObservableObject {
         ]
         dict["actions"] = [action]
 
-        if projectType == .server, let fixedPort = normalizedFixedPort {
+        if let fixedPort = normalizedFixedPort {
             dict["port"] = fixedPort
         }
 

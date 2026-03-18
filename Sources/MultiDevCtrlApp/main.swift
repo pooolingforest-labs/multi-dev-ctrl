@@ -557,17 +557,19 @@ final class ProjectRunner: ObservableObject {
         project.actions.contains { $0.type != .openApp } || (project.stopCommand?.contains("$PORT") ?? false)
     }
 
-    private func resolvePortForRun(_ project: ProjectConfig) -> PortResolution {
-        if project.projectType == .server {
+    private func resolvePortForRun(_ project: ProjectConfig, allProjects: [ProjectConfig] = []) -> PortResolution {
+        let hasFixedPort = project.port.map(isValidPort) ?? false
+
+        if project.projectType == .server || (project.projectType == .client && hasFixedPort) {
             guard let configuredPort = project.port, isValidPort(configuredPort) else {
                 runtimePortsByProject.removeValue(forKey: project.name)
                 return .failed(message: "\(project.name): server 프로젝트는 고정 포트 입력이 필요합니다")
             }
 
-            let unavailable = unavailablePorts(excludingProjectName: project.name)
+            let unavailable = unavailablePorts(excludingProjectName: project.name, allProjects: allProjects)
             guard !unavailable.contains(configuredPort) else {
                 runtimePortsByProject.removeValue(forKey: project.name)
-                return .failed(message: "\(project.name): 서버 포트 \(configuredPort)가 이미 사용 중입니다")
+                return .failed(message: "\(project.name): 포트 \(configuredPort)가 이미 사용 중입니다")
             }
 
             runtimePortsByProject[project.name] = configuredPort
@@ -575,7 +577,7 @@ final class ProjectRunner: ObservableObject {
         }
 
         let preferred = preferredPortForProject(project)
-        let unavailable = unavailablePorts(excludingProjectName: project.name)
+        let unavailable = unavailablePorts(excludingProjectName: project.name, allProjects: allProjects)
 
         if let preferred, !unavailable.contains(preferred) {
             runtimePortsByProject[project.name] = preferred
@@ -599,11 +601,17 @@ final class ProjectRunner: ObservableObject {
         return .resolved(port: selected, preferred: preferred, wasReassigned: preferred != nil && preferred != selected)
     }
 
-    private func unavailablePorts(excludingProjectName: String? = nil) -> Set<Int> {
+    private func unavailablePorts(excludingProjectName: String? = nil, allProjects: [ProjectConfig] = []) -> Set<Int> {
         var ports = checkListeningPorts()
 
         for (projectName, port) in runtimePortsByProject where projectName != excludingProjectName {
             ports.insert(port)
+        }
+
+        for project in allProjects where project.name != excludingProjectName {
+            if let fixedPort = project.port, isValidPort(fixedPort) {
+                ports.insert(fixedPort)
+            }
         }
 
         return ports
@@ -656,7 +664,7 @@ final class ProjectRunner: ObservableObject {
 
         let runtimePort: Int?
         if projectRequiresRuntimePort(project) {
-            switch resolvePortForRun(project) {
+            switch resolvePortForRun(project, allProjects: allProjects) {
             case let .resolved(port, preferred, wasReassigned):
                 runtimePort = port
                 if wasReassigned, let preferred {

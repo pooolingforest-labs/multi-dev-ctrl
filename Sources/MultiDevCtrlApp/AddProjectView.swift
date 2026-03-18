@@ -44,9 +44,13 @@ struct AddProjectView: View {
                     .labelsHidden()
 
                     if state.projectType == .client {
-                        Text("Client는 실행 시 사용 가능한 포트를 자동으로 배정합니다.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField("고정 포트 (선택)", text: $state.fixedPort)
+                                .textFieldStyle(.roundedBorder)
+                            Text("비워두면 실행 시 사용 가능한 포트를 자동으로 배정합니다. 포트를 지정하면 해당 포트를 고정 사용합니다.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     } else {
                         VStack(alignment: .leading, spacing: 6) {
                             TextField("고정 포트", text: $state.fixedPort)
