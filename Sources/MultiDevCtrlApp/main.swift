@@ -637,7 +637,7 @@ final class ProjectRunner: ObservableObject {
         return nil
     }
 
-    func run(_ project: ProjectConfig, allProjects _: [ProjectConfig], terminalMode: TerminalMode = .window) {
+    func run(_ project: ProjectConfig, allProjects: [ProjectConfig], terminalMode: TerminalMode = .window) {
         guard project.isEnabled else {
             statusMessage = "\(project.name): 비활성 프로젝트라 실행하지 않습니다"
             return
