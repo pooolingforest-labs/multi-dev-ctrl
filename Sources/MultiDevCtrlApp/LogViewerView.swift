@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct LogViewerView: View {
@@ -42,26 +43,9 @@ struct LogViewerView: View {
 
             Divider()
 
-            // Log content
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(model.logContent.isEmpty ? " " : model.logContent)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(Color(nsColor: .textColor))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12)
-                        .id("logBottom")
-                }
+            // Log content — NSTextView for performance
+            LogTextView(text: model.logContent, autoScroll: autoScroll)
                 .background(Color(nsColor: NSColor(calibratedWhite: 0.12, alpha: 1.0)))
-                .onChange(of: model.logContent) { _, _ in
-                    if autoScroll {
-                        withAnimation(.easeOut(duration: 0.1)) {
-                            proxy.scrollTo("logBottom", anchor: .bottom)
-                        }
-                    }
-                }
-            }
 
             // Status bar
             if !model.isFileAvailable {
@@ -80,5 +64,84 @@ struct LogViewerView: View {
             }
         }
         .frame(minWidth: 400, minHeight: 300)
+    }
+}
+
+// MARK: - NSTextView wrapper for efficient large-text rendering
+
+struct LogTextView: NSViewRepresentable {
+    let text: String
+    let autoScroll: Bool
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.textColor = .textColor
+        textView.backgroundColor = NSColor(calibratedWhite: 0.12, alpha: 1.0)
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+
+        // Allow horizontal text to wrap
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scrollView.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+
+        scrollView.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.previousText = ""
+
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView else { return }
+        let previousText = context.coordinator.previousText
+
+        if text.hasPrefix(previousText), text.count > previousText.count {
+            // Append-only: incremental update
+            let appendedPart = String(text[text.index(text.startIndex, offsetBy: previousText.count)...])
+            let storage = textView.textStorage!
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                .foregroundColor: NSColor.textColor
+            ]
+            storage.append(NSAttributedString(string: appendedPart, attributes: attrs))
+        } else if text != previousText {
+            // Full replacement (clear/trim)
+            textView.string = text
+            textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            textView.textColor = .textColor
+        }
+
+        context.coordinator.previousText = text
+
+        if autoScroll {
+            textView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    class Coordinator {
+        var textView: NSTextView?
+        var previousText: String = ""
     }
 }

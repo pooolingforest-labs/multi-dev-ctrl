@@ -51,17 +51,9 @@ final class LogViewerWindowController: NSObject, NSWindowDelegate {
 
     private func closeWindow(for projectName: String) {
         guard let window = windows[projectName] else { return }
-        logModels[projectName]?.stopTailing()
+        cleanupWindow(for: projectName)
         window.contentViewController = nil
         window.close()
-
-        DispatchQueue.main.async { [weak self] in
-            self?.windows.removeValue(forKey: projectName)
-            self?.logModels.removeValue(forKey: projectName)
-            if self?.windows.isEmpty == true {
-                NSApp.setActivationPolicy(.accessory)
-            }
-        }
     }
 
     nonisolated func windowWillClose(_ notification: Notification) {
@@ -70,12 +62,16 @@ final class LogViewerWindowController: NSObject, NSWindowDelegate {
                   let identifier = closedWindow.identifier?.rawValue,
                   identifier.hasPrefix("log-") else { return }
             let projectName = String(identifier.dropFirst(4))
-            self?.logModels[projectName]?.stopTailing()
-            self?.windows.removeValue(forKey: projectName)
-            self?.logModels.removeValue(forKey: projectName)
-            if self?.windows.isEmpty == true {
-                NSApp.setActivationPolicy(.accessory)
-            }
+            self?.cleanupWindow(for: projectName)
+        }
+    }
+
+    private func cleanupWindow(for projectName: String) {
+        guard let model = logModels.removeValue(forKey: projectName) else { return }
+        model.stopTailing()
+        windows.removeValue(forKey: projectName)
+        if windows.isEmpty {
+            NSApp.setActivationPolicy(.accessory)
         }
     }
 

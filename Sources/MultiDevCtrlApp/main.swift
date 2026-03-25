@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import UserNotifications
 
 enum TerminalMode: String, Codable {
     case window
@@ -524,6 +525,7 @@ final class ProjectRunner: ObservableObject {
     private var terminalWindowsByProject: [String: TerminalWindowRef] = [:]
     private var dependencyInstallInProgressProjects: Set<String> = []
     private var runtimePortsByProject: [String: Int] = [:]
+    private var intentionalStops: Set<String> = []
     private let fallbackPortStart = 3000
 
     private enum PortResolution {
@@ -1689,6 +1691,7 @@ final class ProjectRunner: ObservableObject {
 
     func stop(project: ProjectConfig, allProjects _: [ProjectConfig], silent: Bool = false) {
         let projectName = project.name
+        intentionalStops.insert(projectName)
         let managedProcesses = processesByProject.removeValue(forKey: projectName) ?? []
         let hadManagedProcess = !managedProcesses.isEmpty
 
@@ -1781,6 +1784,10 @@ final class ProjectRunner: ObservableObject {
             return
         }
 
+        let process = managedProcesses[idx].process
+        let exitCode = process.terminationStatus
+        let reason = process.terminationReason
+
         managedProcesses[idx].logFileHandle?.closeFile()
         managedProcesses.remove(at: idx)
 
@@ -1788,10 +1795,42 @@ final class ProjectRunner: ObservableObject {
             processesByProject.removeValue(forKey: projectName)
             runningProjects.remove(projectName)
             runtimePortsByProject.removeValue(forKey: projectName)
-            statusMessage = "\(projectName): process exited"
+
+            let wasIntentional = intentionalStops.remove(projectName) != nil
+
+            if !wasIntentional && (exitCode != 0 || reason == .uncaughtSignal) {
+                let logURL = logsDirectory.appendingPathComponent("\(sanitize(projectName)).log")
+                sendCrashNotification(projectName: projectName, exitCode: exitCode, logURL: logURL)
+                statusMessage = "\(projectName): 비정상 종료 (exit code: \(exitCode))"
+            } else {
+                statusMessage = "\(projectName): process exited"
+            }
         } else {
             processesByProject[projectName] = managedProcesses
         }
+    }
+
+    private func sendCrashNotification(projectName: String, exitCode: Int32, logURL: URL) {
+        let content = UNMutableNotificationContent()
+        content.title = "\(projectName) 서비스 종료"
+        content.sound = .default
+
+        let tailLines = readTailLines(from: logURL, lineCount: 5)
+        content.body = "Exit code: \(exitCode)\n\(tailLines)"
+
+        let request = UNNotificationRequest(
+            identifier: "crash-\(projectName)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private nonisolated func readTailLines(from url: URL, lineCount: Int) -> String {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        return lines.suffix(lineCount).joined(separator: "\n")
     }
 
     private func openApplication(named appName: String) -> Bool {
@@ -2773,6 +2812,7 @@ struct MultiDevCtrlApp: App {
     init() {
         // Keep the app as a menu bar accessory when launched outside Finder.
         NSApplication.shared.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
     var body: some Scene {
